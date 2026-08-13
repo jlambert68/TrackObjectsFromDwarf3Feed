@@ -8,35 +8,91 @@ import (
 	"gocv.io/x/gocv"
 )
 
-// Detection and tracking thresholds. These values define the blob size window,
-// velocity bands, and the amount of track persistence bookkeeping kept after
-// detections temporarily disappear.
 const (
-	minArea = 6.0
-	maxArea = 15000.0
-
-	slowMinSpeed = 10.0
-	minSpeed     = 40.0
-
-	maxMatchDistance = 100.0
-	minHits          = 2
-
-	maxMissedFrames     = 8
-	blurSize            = 5
-	foregroundThreshold = 200.0
-
-	preEventDuration  = 5 * time.Second
-	postEventDuration = 5 * time.Second
-
-	mog2History      = 500
-	mog2VarThreshold = 16.0
-
 	trackBoxScale     = 4
 	trackCircleRadius = 16
 	trackCrosshairArm = 24
-
-	trackingROIHeightFraction = 0.90
 )
+
+type TrackingSettings struct {
+	MinArea               float64
+	MaxArea               float64
+	SlowMinSpeed          float64
+	MinSpeed              float64
+	MaxMatchDistance      float64
+	MinHits               int
+	BlurSize              int
+	ForegroundThreshold   float64
+	PreEventDuration      time.Duration
+	PostEventDuration     time.Duration
+	MOG2History           int
+	MOG2VarThreshold      float64
+	TrackingROIHeightFrac float64
+}
+
+func DefaultTrackingSettings() TrackingSettings {
+	return TrackingSettings{
+		MinArea:               6.0,
+		MaxArea:               15000.0,
+		SlowMinSpeed:          10.0,
+		MinSpeed:              40.0,
+		MaxMatchDistance:      100.0,
+		MinHits:               2,
+		BlurSize:              5,
+		ForegroundThreshold:   200.0,
+		PreEventDuration:      5 * time.Second,
+		PostEventDuration:     5 * time.Second,
+		MOG2History:           500,
+		MOG2VarThreshold:      16.0,
+		TrackingROIHeightFrac: 0.90,
+	}
+}
+
+func NormalizeTrackingSettings(settings TrackingSettings) TrackingSettings {
+	defaults := DefaultTrackingSettings()
+
+	if settings.MinArea <= 0 {
+		settings.MinArea = defaults.MinArea
+	}
+	if settings.MaxArea <= settings.MinArea {
+		settings.MaxArea = defaults.MaxArea
+	}
+	if settings.SlowMinSpeed <= 0 {
+		settings.SlowMinSpeed = defaults.SlowMinSpeed
+	}
+	if settings.MinSpeed < settings.SlowMinSpeed {
+		settings.MinSpeed = defaults.MinSpeed
+	}
+	if settings.MaxMatchDistance <= 0 {
+		settings.MaxMatchDistance = defaults.MaxMatchDistance
+	}
+	if settings.MinHits < 1 {
+		settings.MinHits = defaults.MinHits
+	}
+	if settings.BlurSize < 1 || settings.BlurSize%2 == 0 {
+		settings.BlurSize = defaults.BlurSize
+	}
+	if settings.ForegroundThreshold <= 0 {
+		settings.ForegroundThreshold = defaults.ForegroundThreshold
+	}
+	if settings.PreEventDuration <= 0 {
+		settings.PreEventDuration = defaults.PreEventDuration
+	}
+	if settings.PostEventDuration <= 0 {
+		settings.PostEventDuration = defaults.PostEventDuration
+	}
+	if settings.MOG2History < 1 {
+		settings.MOG2History = defaults.MOG2History
+	}
+	if settings.MOG2VarThreshold <= 0 {
+		settings.MOG2VarThreshold = defaults.MOG2VarThreshold
+	}
+	if settings.TrackingROIHeightFrac <= 0 || settings.TrackingROIHeightFrac > 1 {
+		settings.TrackingROIHeightFrac = defaults.TrackingROIHeightFrac
+	}
+
+	return settings
+}
 
 // Overlay colors for the live view and the tracked event exports.
 var (
@@ -118,19 +174,20 @@ type FrameMetadata struct {
 // EventSummary is the short per-event manifest written beside the captured
 // videos and full tracking JSON.
 type EventSummary struct {
-	EventID           string    `json:"event_id"`
-	StartedAt         time.Time `json:"started_at"`
-	EndedAt           time.Time `json:"ended_at"`
-	DurationSeconds   float64   `json:"duration_seconds"`
-	Width             int       `json:"width"`
-	Height            int       `json:"height"`
-	FPS               float64   `json:"fps"`
-	Frames            int       `json:"frames"`
-	UniqueObjects     int       `json:"unique_objects"`
-	HighestSpeedPxSec float64   `json:"highest_speed_px_s"`
-	OriginalVideo     string    `json:"original_video"`
-	TrackedVideo      string    `json:"tracked_video"`
-	TrackingMetadata  string    `json:"tracking_metadata"`
+	EventID           string           `json:"event_id"`
+	StartedAt         time.Time        `json:"started_at"`
+	EndedAt           time.Time        `json:"ended_at"`
+	DurationSeconds   float64          `json:"duration_seconds"`
+	Width             int              `json:"width"`
+	Height            int              `json:"height"`
+	FPS               float64          `json:"fps"`
+	Frames            int              `json:"frames"`
+	UniqueObjects     int              `json:"unique_objects"`
+	HighestSpeedPxSec float64          `json:"highest_speed_px_s"`
+	OriginalVideo     string           `json:"original_video"`
+	TrackedVideo      string           `json:"tracked_video"`
+	TrackingMetadata  string           `json:"tracking_metadata"`
+	TrackingSettings  TrackingSettings `json:"tracking_settings"`
 }
 
 // EventMetadata contains the full timeline for a recorded event.
@@ -167,6 +224,7 @@ type EventRecorder struct {
 	SeenIDs  map[int]struct{}
 
 	HighestSpeed float64
+	Settings     TrackingSettings
 }
 
 // Source mode names used by flags and the optional startup prompt.

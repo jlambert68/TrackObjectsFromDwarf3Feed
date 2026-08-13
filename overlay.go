@@ -10,12 +10,12 @@ import (
 
 // drawLiveOverlay renders the current accepted tracks onto the interactive live
 // preview window.
-func drawLiveOverlay(frame *gocv.Mat, tracks []*Track) {
-	drawTrackingROI(frame)
+func drawLiveOverlay(frame *gocv.Mat, tracks []*Track, settings TrackingSettings) {
+	drawTrackingROI(frame, settings)
 
 	for _, track := range tracks {
-		trackType, ok := classifyTrack(track)
-		if track.Hits < minHits || !ok {
+		trackType, ok := classifyTrack(track, settings)
+		if track.Hits < settings.MinHits || !ok {
 			continue
 		}
 
@@ -34,8 +34,9 @@ func drawLiveOverlay(frame *gocv.Mat, tracks []*Track) {
 
 // drawMetadataOverlay reconstructs track trails from saved metadata so the
 // tracked export video shows the same context as the live preview.
-func drawMetadataOverlay(frame *gocv.Mat, tracks []TrackMetadata) {
-	drawTrackingROI(frame)
+func drawMetadataOverlay(frame *gocv.Mat, tracks []TrackMetadata, settings TrackingSettings) {
+	settings = NormalizeTrackingSettings(settings)
+	drawTrackingROI(frame, settings)
 
 	for _, t := range tracks {
 		trackColor, arrowColor := overlayColors(t.Type)

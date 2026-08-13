@@ -19,6 +19,7 @@ type TrackerConfig struct {
 	OutputDir   string
 	ShowMask    bool
 	FallbackFPS float64
+	Settings    TrackingSettings
 }
 
 // TrackerReady reports source properties once the input stream has opened.
@@ -116,7 +117,7 @@ func (e *TrackerEngine) Run() error {
 	// Disable MOG2 shadow labeling so moving objects darker than the background
 	// are still emitted as full foreground instead of being downgraded to the
 	// intermediate "shadow" class and discarded by the later binary threshold.
-	background := gocv.NewBackgroundSubtractorMOG2WithParams(mog2History, mog2VarThreshold, false)
+	background := gocv.NewBackgroundSubtractorMOG2WithParams(e.Config.Settings.MOG2History, e.Config.Settings.MOG2VarThreshold, false)
 	defer background.Close()
 
 	openKernel := gocv.GetStructuringElement(gocv.MorphEllipse, image.Pt(3, 3))
@@ -162,13 +163,13 @@ func (e *TrackerEngine) Run() error {
 		if err := gocv.CvtColor(frame, &gray, gocv.ColorBGRToGray); err != nil {
 			continue
 		}
-		if err := gocv.GaussianBlur(gray, &blurred, image.Pt(blurSize, blurSize), 0, 0, gocv.BorderDefault); err != nil {
+		if err := gocv.GaussianBlur(gray, &blurred, image.Pt(e.Config.Settings.BlurSize, e.Config.Settings.BlurSize), 0, 0, gocv.BorderDefault); err != nil {
 			continue
 		}
 		if err := background.Apply(blurred, &mask); err != nil {
 			continue
 		}
-		gocv.Threshold(mask, &cleanMask, foregroundThreshold, 255, gocv.ThresholdBinary)
+		gocv.Threshold(mask, &cleanMask, float32(e.Config.Settings.ForegroundThreshold), 255, gocv.ThresholdBinary)
 		if err := gocv.MorphologyEx(cleanMask, &cleanMask, gocv.MorphOpen, openKernel); err != nil {
 			continue
 		}
@@ -176,15 +177,15 @@ func (e *TrackerEngine) Run() error {
 			continue
 		}
 
-		trackingROI := trackingROIForSize(frame.Cols(), frame.Rows())
+		trackingROI := trackingROIForSize(frame.Cols(), frame.Rows(), e.Config.Settings)
 		applyTrackingROI(&cleanMask, trackingROI)
 
-		detections := findDetections(cleanMask)
-		tracks, nextTrackID = updateTracks(tracks, detections, now, frameDT, nextTrackID)
+		detections := findDetections(cleanMask, e.Config.Settings)
+		tracks, nextTrackID = updateTracks(tracks, detections, now, frameDT, nextTrackID, e.Config.Settings)
 		tracks = filterTracksToROI(tracks, trackingROI)
 
-		meta := makeFrameMetadata(sourceFrame, firstFrameTime, now, tracks)
-		interesting := hasFreshInterestingTracks(tracks)
+		meta := makeFrameMetadata(sourceFrame, firstFrameTime, now, tracks, e.Config.Settings)
+		interesting := hasFreshInterestingTracks(tracks, e.Config.Settings)
 
 		if interesting {
 			lastInteresting = now
@@ -196,10 +197,10 @@ func (e *TrackerEngine) Run() error {
 				Timestamp: now,
 				Metadata:  meta,
 			})
-			buffer = trimBuffer(buffer, now.Add(-preEventDuration))
+			buffer = trimBuffer(buffer, now.Add(-e.Config.Settings.PreEventDuration))
 
 			if interesting {
-				recorder, err = startEvent(e.Config.OutputDir, fps, frame.Cols(), frame.Rows(), buffer)
+				recorder, err = startEvent(e.Config.OutputDir, fps, frame.Cols(), frame.Rows(), buffer, e.Config.Settings)
 				if err != nil {
 					closeBuffer(buffer)
 					return err
@@ -219,7 +220,7 @@ func (e *TrackerEngine) Run() error {
 				return err
 			}
 
-			if !lastInteresting.IsZero() && now.Sub(lastInteresting) >= postEventDuration {
+			if !lastInteresting.IsZero() && now.Sub(lastInteresting) >= e.Config.Settings.PostEventDuration {
 				dir := recorder.Directory
 				if err := recorder.Finish(now); err != nil {
 					return err
@@ -236,7 +237,7 @@ func (e *TrackerEngine) Run() error {
 			}
 		}
 
-		update := buildFrameUpdate(frame, cleanMask, tracks, meta, len(detections), recorder != nil, sourceFrame < int(fps*3), e.Config.ShowMask)
+		update := buildFrameUpdate(frame, cleanMask, tracks, meta, len(detections), recorder != nil, sourceFrame < int(fps*3), e.Config.ShowMask, e.Config.Settings)
 		err = e.emitFrame(update, now)
 		update.Close()
 		if err != nil {
@@ -337,9 +338,10 @@ func buildFrameUpdate(
 	recording bool,
 	learningBackground bool,
 	includeMask bool,
+	settings TrackingSettings,
 ) FrameUpdate {
 	display := frame.Clone()
-	drawLiveOverlay(&display, tracks)
+	drawLiveOverlay(&display, tracks, settings)
 
 	fastCount, slowCount := countTrackTypes(meta.Tracks)
 	status := fmt.Sprintf("FAST: %d   SLOW: %d   detections: %d   tracks: %d",
@@ -351,7 +353,7 @@ func buildFrameUpdate(
 		gocv.PutText(&display, "RECORDING EVENT", image.Pt(20, 60),
 			gocv.FontHersheySimplex, 0.65, warnColor, 2)
 	} else {
-		gocv.PutText(&display, fmt.Sprintf("RAM PREBUFFER: %.0fs", preEventDuration.Seconds()),
+		gocv.PutText(&display, fmt.Sprintf("RAM PREBUFFER: %.0fs", settings.PreEventDuration.Seconds()),
 			image.Pt(20, 60), gocv.FontHersheySimplex, 0.5, textColor, 1)
 	}
 

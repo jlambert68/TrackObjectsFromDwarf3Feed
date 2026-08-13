@@ -10,7 +10,7 @@ import (
 
 // findDetections converts the cleaned foreground mask into bounding boxes and
 // centers that can be handed to the tracker.
-func findDetections(mask gocv.Mat) []Detection {
+func findDetections(mask gocv.Mat, settings TrackingSettings) []Detection {
 	contours := gocv.FindContours(mask, gocv.RetrievalExternal, gocv.ChainApproxSimple)
 	defer contours.Close()
 
@@ -20,7 +20,7 @@ func findDetections(mask gocv.Mat) []Detection {
 		contour := contours.At(i)
 		area := gocv.ContourArea(contour)
 
-		if area < minArea || area > maxArea {
+		if area < settings.MinArea || area > settings.MaxArea {
 			continue
 		}
 
@@ -51,6 +51,7 @@ func updateTracks(
 	now time.Time,
 	frameDT float64,
 	nextTrackID int,
+	settings TrackingSettings,
 ) ([]*Track, int) {
 	detectionUsed := make([]bool, len(detections))
 	trackMatched := make([]bool, len(tracks))
@@ -84,7 +85,7 @@ func updateTracks(
 				dy := float64(detection.Center.Y) - predictedY
 				distance := math.Hypot(dx, dy)
 
-				if distance < bestDistance && distance <= maxMatchDistance {
+				if distance < bestDistance && distance <= settings.MaxMatchDistance {
 					bestDistance = distance
 					bestTrack = ti
 					bestDetection = di
@@ -162,7 +163,7 @@ func updateTracks(
 
 // makeFrameMetadata filters the active tracks down to the ones considered
 // stable and interesting enough to persist.
-func makeFrameMetadata(sourceFrame int, start, now time.Time, tracks []*Track) FrameMetadata {
+func makeFrameMetadata(sourceFrame int, start, now time.Time, tracks []*Track, settings TrackingSettings) FrameMetadata {
 	meta := FrameMetadata{
 		SourceFrame: sourceFrame,
 		TimeUnixNS:  now.UnixNano(),
@@ -171,8 +172,8 @@ func makeFrameMetadata(sourceFrame int, start, now time.Time, tracks []*Track) F
 	}
 
 	for _, t := range tracks {
-		trackType, ok := classifyTrack(t)
-		if t.Hits < minHits || !ok {
+		trackType, ok := classifyTrack(t, settings)
+		if t.Hits < settings.MinHits || !ok {
 			continue
 		}
 
@@ -207,19 +208,19 @@ func makeTrailMetadata(points []image.Point) []TrailPoint {
 	return trail
 }
 
-func classifyTrack(t *Track) (string, bool) {
-	if t.Speed >= minSpeed {
+func classifyTrack(t *Track, settings TrackingSettings) (string, bool) {
+	if t.Speed >= settings.MinSpeed {
 		return trackTypeFast, true
 	}
-	if t.Speed >= slowMinSpeed {
+	if t.Speed >= settings.SlowMinSpeed {
 		return trackTypeSlow, true
 	}
 	return "", false
 }
 
-func hasFreshInterestingTracks(tracks []*Track) bool {
+func hasFreshInterestingTracks(tracks []*Track, settings TrackingSettings) bool {
 	for _, track := range tracks {
-		trackType, ok := classifyTrack(track)
+		trackType, ok := classifyTrack(track, settings)
 		if ok && trackType == trackTypeFast && track.Missed == 0 {
 			return true
 		}

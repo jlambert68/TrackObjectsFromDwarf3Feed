@@ -40,6 +40,7 @@ func startEvent(
 	fps float64,
 	width, height int,
 	buffer []BufferedFrame,
+	settings TrackingSettings,
 ) (*EventRecorder, error) {
 	if len(buffer) == 0 {
 		return nil, errors.New("cannot start event with empty buffer")
@@ -92,6 +93,7 @@ func startEvent(
 		Width:         width,
 		Height:        height,
 		SeenIDs:       make(map[int]struct{}),
+		Settings:      NormalizeTrackingSettings(settings),
 		Metadata: EventMetadata{
 			EventID:   filepath.Base(dir),
 			StartedAt: startedAt,
@@ -121,7 +123,7 @@ func (r *EventRecorder) RecordFrame(clean gocv.Mat, meta FrameMetadata) error {
 	}
 
 	overlay := clean.Clone()
-	drawMetadataOverlay(&overlay, meta.Tracks)
+	drawMetadataOverlay(&overlay, meta.Tracks, r.Settings)
 	if err := r.TrackedWriter.Write(overlay); err != nil {
 		overlay.Close()
 		return fmt.Errorf("write tracked video: %w", err)
@@ -177,6 +179,7 @@ func (r *EventRecorder) Finish(endedAt time.Time) error {
 		OriginalVideo:     "original.avi",
 		TrackedVideo:      "tracked.avi",
 		TrackingMetadata:  "tracking.json",
+		TrackingSettings:  r.Settings,
 	}
 
 	summaryData, err := json.MarshalIndent(summary, "", "  ")

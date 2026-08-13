@@ -7,12 +7,12 @@ import (
 	"gocv.io/x/gocv"
 )
 
-func trackingROIForSize(width, height int) image.Rectangle {
+func trackingROIForSize(width, height int, settings TrackingSettings) image.Rectangle {
 	if width <= 0 || height <= 0 {
 		return image.Rectangle{}
 	}
 
-	roiHeight := int(float64(height) * trackingROIHeightFraction)
+	roiHeight := int(float64(height) * settings.TrackingROIHeightFrac)
 	if roiHeight <= 0 || roiHeight >= height {
 		return image.Rect(0, 0, width, height)
 	}
@@ -55,8 +55,8 @@ func filterTracksToROI(tracks []*Track, roi image.Rectangle) []*Track {
 	return filtered
 }
 
-func drawTrackingROI(frame *gocv.Mat) {
-	roi := trackingROIForSize(frame.Cols(), frame.Rows())
+func drawTrackingROI(frame *gocv.Mat, settings TrackingSettings) {
+	roi := trackingROIForSize(frame.Cols(), frame.Rows(), settings)
 	if roi.Empty() {
 		return
 	}
