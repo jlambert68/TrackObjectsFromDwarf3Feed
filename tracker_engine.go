@@ -79,11 +79,16 @@ type TrackerHooks struct {
 type TrackerEngine struct {
 	Config TrackerConfig
 	Hooks  TrackerHooks
+	Stop   <-chan struct{}
 }
 
 // Run executes the tracker until the input ends, the caller asks it to stop,
 // or an error occurs.
 func (e *TrackerEngine) Run() error {
+	if e.stopped() {
+		return nil
+	}
+
 	capture, fps, err := e.openCapture()
 	if err != nil {
 		return err
@@ -130,6 +135,10 @@ func (e *TrackerEngine) Run() error {
 	lastInteresting := time.Time{}
 
 	for {
+		if e.stopped() {
+			break
+		}
+
 		if ok := capture.Read(&frame); !ok || frame.Empty() {
 			if e.Config.InputLabel == "video file" {
 				break
@@ -251,6 +260,19 @@ func (e *TrackerEngine) Run() error {
 	}
 
 	return nil
+}
+
+func (e *TrackerEngine) stopped() bool {
+	if e.Stop == nil {
+		return false
+	}
+
+	select {
+	case <-e.Stop:
+		return true
+	default:
+		return false
+	}
 }
 
 func (e *TrackerEngine) openCapture() (*gocv.VideoCapture, float64, error) {
