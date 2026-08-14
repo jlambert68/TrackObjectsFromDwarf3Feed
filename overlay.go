@@ -61,6 +61,21 @@ func drawMetadataOverlay(frame *gocv.Mat, tracks []TrackMetadata, settings Track
 	}
 }
 
+func filterTrackMetadataByID(tracks []TrackMetadata, id int) []TrackMetadata {
+	if id <= 0 || len(tracks) == 0 {
+		return tracks
+	}
+
+	filtered := make([]TrackMetadata, 0, 1)
+	for _, track := range tracks {
+		if track.ID == id {
+			filtered = append(filtered, track)
+			break
+		}
+	}
+	return filtered
+}
+
 func overlayColors(trackType string) (trackColor, arrowColor color.RGBA) {
 	if trackType == trackTypeSlow {
 		return slowTrackColor, slowArrowColor

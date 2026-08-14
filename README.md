@@ -5,6 +5,9 @@ and automatically records event folders containing:
 
 - `original.avi` — untouched frames from the RTSP stream
 - `tracked.avi` — the same frames with boxes, IDs, trails, velocity arrows and speed
+- `masked.avi` — the cleaned binary motion mask used for detection
+- `track_crops/` — per-object close-up snapshots grouped by tracked object ID
+- `track_names.json` — user-editable names for tracked objects in that event
 - `tracking.json` — per-frame coordinates, bounding boxes and velocity metadata
 - `event.json` — summary for the event
 
@@ -52,6 +55,11 @@ events/
   2026-08-11_151000.123/
     original.avi
     tracked.avi
+    masked.avi
+    track_crops/
+      object_0001/
+        frame_000123_000004321ms.jpg
+    track_names.json
     tracking.json
     event.json
 ```

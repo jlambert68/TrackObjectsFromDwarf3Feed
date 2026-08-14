@@ -186,6 +186,9 @@ type EventSummary struct {
 	HighestSpeedPxSec float64          `json:"highest_speed_px_s"`
 	OriginalVideo     string           `json:"original_video"`
 	TrackedVideo      string           `json:"tracked_video"`
+	MaskedVideo       string           `json:"masked_video"`
+	TrackCropsDir     string           `json:"track_crops_dir"`
+	TrackNamesFile    string           `json:"track_names_file"`
 	TrackingMetadata  string           `json:"tracking_metadata"`
 	TrackingSettings  TrackingSettings `json:"tracking_settings"`
 }
@@ -204,6 +207,7 @@ type EventMetadata struct {
 // context before the first fast object is detected.
 type BufferedFrame struct {
 	Image     gocv.Mat
+	Mask      gocv.Mat
 	Timestamp time.Time
 	Metadata  FrameMetadata
 }
@@ -213,6 +217,7 @@ type BufferedFrame struct {
 type EventRecorder struct {
 	RawWriter     *gocv.VideoWriter
 	TrackedWriter *gocv.VideoWriter
+	MaskedWriter  *gocv.VideoWriter
 
 	Directory string
 	StartedAt time.Time

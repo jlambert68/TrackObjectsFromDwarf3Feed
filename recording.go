@@ -4,11 +4,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
 	"os"
 	"path/filepath"
 	"time"
 
 	"gocv.io/x/gocv"
+)
+
+const (
+	minTrackCropWidth  = 96
+	minTrackCropHeight = 96
 )
 
 // trimBuffer keeps only the pre-event time window in RAM and releases the Mats
@@ -17,6 +23,7 @@ func trimBuffer(buffer []BufferedFrame, cutoff time.Time) []BufferedFrame {
 	firstKeep := 0
 	for firstKeep < len(buffer) && buffer[firstKeep].Timestamp.Before(cutoff) {
 		buffer[firstKeep].Image.Close()
+		buffer[firstKeep].Mask.Close()
 		firstKeep++
 	}
 
@@ -30,6 +37,7 @@ func trimBuffer(buffer []BufferedFrame, cutoff time.Time) []BufferedFrame {
 func closeBuffer(buffer []BufferedFrame) {
 	for i := range buffer {
 		buffer[i].Image.Close()
+		buffer[i].Mask.Close()
 	}
 }
 
@@ -63,6 +71,7 @@ func startEvent(
 
 	rawPath := filepath.Join(dir, "original.avi")
 	trackedPath := filepath.Join(dir, "tracked.avi")
+	maskedPath := filepath.Join(dir, "masked.avi")
 
 	rawWriter, err := gocv.VideoWriterFile(rawPath, "MJPG", fps, width, height, true)
 	if err != nil {
@@ -84,9 +93,23 @@ func startEvent(
 		return nil, errors.New("tracked video writer did not open")
 	}
 
+	maskedWriter, err := gocv.VideoWriterFile(maskedPath, "MJPG", fps, width, height, true)
+	if err != nil {
+		rawWriter.Close()
+		trackedWriter.Close()
+		return nil, fmt.Errorf("create masked video: %w", err)
+	}
+	if !maskedWriter.IsOpened() {
+		rawWriter.Close()
+		trackedWriter.Close()
+		maskedWriter.Close()
+		return nil, errors.New("masked video writer did not open")
+	}
+
 	recorder := &EventRecorder{
 		RawWriter:     rawWriter,
 		TrackedWriter: trackedWriter,
+		MaskedWriter:  maskedWriter,
 		Directory:     dir,
 		StartedAt:     startedAt,
 		FPS:           fps,
@@ -105,9 +128,10 @@ func startEvent(
 	}
 
 	for _, bf := range buffer {
-		if err := recorder.RecordFrame(bf.Image, bf.Metadata); err != nil {
+		if err := recorder.RecordFrame(bf.Image, bf.Mask, bf.Metadata); err != nil {
 			recorder.RawWriter.Close()
 			recorder.TrackedWriter.Close()
+			recorder.MaskedWriter.Close()
 			return nil, err
 		}
 	}
@@ -117,7 +141,9 @@ func startEvent(
 
 // RecordFrame writes one raw frame, creates the annotated tracked frame, and
 // appends the JSON metadata for that frame.
-func (r *EventRecorder) RecordFrame(clean gocv.Mat, meta FrameMetadata) error {
+func (r *EventRecorder) RecordFrame(clean gocv.Mat, mask gocv.Mat, meta FrameMetadata) error {
+	meta.TimeMS = time.Unix(0, meta.TimeUnixNS).Sub(r.StartedAt).Milliseconds()
+
 	if err := r.RawWriter.Write(clean); err != nil {
 		return fmt.Errorf("write original video: %w", err)
 	}
@@ -130,6 +156,19 @@ func (r *EventRecorder) RecordFrame(clean gocv.Mat, meta FrameMetadata) error {
 	}
 	overlay.Close()
 
+	maskBGR := gocv.NewMat()
+	defer maskBGR.Close()
+	if err := gocv.CvtColor(mask, &maskBGR, gocv.ColorGrayToBGR); err != nil {
+		return fmt.Errorf("convert mask video frame: %w", err)
+	}
+	if err := r.MaskedWriter.Write(maskBGR); err != nil {
+		return fmt.Errorf("write masked video: %w", err)
+	}
+
+	if err := r.saveTrackCrops(clean, meta); err != nil {
+		return err
+	}
+
 	for _, t := range meta.Tracks {
 		r.SeenIDs[t.ID] = struct{}{}
 		if t.Speed > r.HighestSpeed {
@@ -137,7 +176,6 @@ func (r *EventRecorder) RecordFrame(clean gocv.Mat, meta FrameMetadata) error {
 		}
 	}
 
-	meta.TimeMS = time.Unix(0, meta.TimeUnixNS).Sub(r.StartedAt).Milliseconds()
 	r.Metadata.Frames = append(r.Metadata.Frames, meta)
 	return nil
 }
@@ -153,6 +191,11 @@ func (r *EventRecorder) Finish(endedAt time.Time) error {
 	}
 	if r.TrackedWriter != nil {
 		if err := r.TrackedWriter.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if r.MaskedWriter != nil {
+		if err := r.MaskedWriter.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -178,6 +221,9 @@ func (r *EventRecorder) Finish(endedAt time.Time) error {
 		HighestSpeedPxSec: r.HighestSpeed,
 		OriginalVideo:     "original.avi",
 		TrackedVideo:      "tracked.avi",
+		MaskedVideo:       "masked.avi",
+		TrackCropsDir:     "track_crops",
+		TrackNamesFile:    "track_names.json",
 		TrackingMetadata:  "tracking.json",
 		TrackingSettings:  r.Settings,
 	}
@@ -190,4 +236,69 @@ func (r *EventRecorder) Finish(endedAt time.Time) error {
 	}
 
 	return errors.Join(errs...)
+}
+
+func (r *EventRecorder) saveTrackCrops(frame gocv.Mat, meta FrameMetadata) error {
+	if frame.Empty() || len(meta.Tracks) == 0 {
+		return nil
+	}
+
+	root := filepath.Join(r.Directory, "track_crops")
+	frameBounds := image.Rect(0, 0, frame.Cols(), frame.Rows())
+
+	for _, track := range meta.Tracks {
+		rect := image.Rect(
+			track.BoxX,
+			track.BoxY,
+			track.BoxX+track.BoxWidth,
+			track.BoxY+track.BoxHeight,
+		)
+		rect = expandedTrackCropRect(rect).Intersect(frameBounds)
+		if rect.Empty() {
+			continue
+		}
+
+		objectDir := filepath.Join(root, fmt.Sprintf("object_%04d", track.ID))
+		if err := os.MkdirAll(objectDir, 0755); err != nil {
+			return fmt.Errorf("create track crop directory: %w", err)
+		}
+
+		crop := frame.Region(rect)
+		filename := filepath.Join(objectDir,
+			fmt.Sprintf("frame_%06d_%09dms.jpg", meta.SourceFrame, meta.TimeMS))
+		if ok := gocv.IMWrite(filename, crop); !ok {
+			crop.Close()
+			return fmt.Errorf("save track crop %s", filename)
+		}
+		crop.Close()
+	}
+
+	return nil
+}
+
+func expandedTrackCropRect(rect image.Rectangle) image.Rectangle {
+	rect = scaleRectAroundCenter(rect, trackBoxScale)
+	if rect.Empty() {
+		return rect
+	}
+
+	centerX := (rect.Min.X + rect.Max.X) / 2
+	centerY := (rect.Min.Y + rect.Max.Y) / 2
+	width := rect.Dx()
+	height := rect.Dy()
+	if width < minTrackCropWidth {
+		width = minTrackCropWidth
+	}
+	if height < minTrackCropHeight {
+		height = minTrackCropHeight
+	}
+
+	halfWidth := width / 2
+	halfHeight := height / 2
+	return image.Rect(
+		centerX-halfWidth,
+		centerY-halfHeight,
+		centerX-halfWidth+width,
+		centerY-halfHeight+height,
+	)
 }

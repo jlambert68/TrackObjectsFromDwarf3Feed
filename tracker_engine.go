@@ -194,6 +194,7 @@ func (e *TrackerEngine) Run() error {
 		if recorder == nil {
 			buffer = append(buffer, BufferedFrame{
 				Image:     frame.Clone(),
+				Mask:      cleanMask.Clone(),
 				Timestamp: now,
 				Metadata:  meta,
 			})
@@ -216,7 +217,7 @@ func (e *TrackerEngine) Run() error {
 				}
 			}
 		} else {
-			if err := recorder.RecordFrame(frame, meta); err != nil {
+			if err := recorder.RecordFrame(frame, cleanMask, meta); err != nil {
 				return err
 			}
 
