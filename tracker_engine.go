@@ -231,7 +231,7 @@ func (e *TrackerEngine) Run() error {
 				}
 			}
 		} else {
-			if err := recorder.RecordFrame(frame, cleanMask, meta); err != nil {
+			if err := recorder.RecordFrame(frame, cleanMask, tracks, meta); err != nil {
 				return err
 			}
 

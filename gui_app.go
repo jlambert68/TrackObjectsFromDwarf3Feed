@@ -156,6 +156,7 @@ type playbackOverlay struct {
 	SelectedTrackID    int
 	Label              string
 	CropBySourceFrame  map[int]string
+	CropSourceFrames   []int
 	ObjectMapSkipCount int
 }
 
@@ -1179,14 +1180,14 @@ func (ui *trackerApp) runPlayback(path, label, maskPath string, stopCh chan stru
 			frameMeta := overlay.Tracking.Frames[frameIndex]
 			sourceFrame := frameMeta.SourceFrame
 			selectedTrack, hasSelectedTrack := selectedTrackInFrame(frameMeta, overlay.SelectedTrackID)
-			if cropPath := overlay.CropBySourceFrame[sourceFrame]; cropPath != "" && hasSelectedTrack {
+			if cropPath := lookupObjectCropPath(overlay, sourceFrame); cropPath != "" {
 				cropFrame = gocv.IMRead(cropPath, gocv.IMReadColor)
 				if !cropFrame.Empty() {
 					objectImage, err = cropFrame.ToImage()
 					if err == nil {
 						objectImage = cloneImage(objectImage)
 					}
-					if err == nil && objectMapCanvas != nil {
+					if err == nil && objectMapCanvas != nil && hasSelectedTrack {
 						if objectMapSeen%(overlay.ObjectMapSkipCount+1) == 0 {
 							maskCropImage, maskErr := extractObjectMaskImage(maskFrame, selectedTrack)
 							if maskErr == nil {
@@ -1953,12 +1954,14 @@ func (ui *trackerApp) watchSelectedObject() {
 		maskPath = filepath.Join(entry.Directory, "masked.avi")
 	}
 
+	cropBySourceFrame, cropSourceFrames := makeCropBySourceFrame(object.CropPaths)
 	overlay := &playbackOverlay{
 		Tracking:           *ui.currentDetail.Tracking,
 		Settings:           NormalizeTrackingSettings(ui.currentDetail.Summary.TrackingSettings),
 		SelectedTrackID:    object.ID,
 		Label:              formatObjectOption(object),
-		CropBySourceFrame:  makeCropBySourceFrame(object.CropPaths),
+		CropBySourceFrame:  cropBySourceFrame,
+		CropSourceFrames:   cropSourceFrames,
 		ObjectMapSkipCount: objectMapSkipCount,
 	}
 
@@ -2275,20 +2278,40 @@ func listObjectCropPaths(dir string) ([]string, error) {
 	return paths, nil
 }
 
-func makeCropBySourceFrame(paths []string) map[int]string {
+func makeCropBySourceFrame(paths []string) (map[int]string, []int) {
 	if len(paths) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	crops := make(map[int]string, len(paths))
+	frames := make([]int, 0, len(paths))
 	for _, path := range paths {
 		name := filepath.Base(path)
 		var sourceFrame int
 		if _, err := fmt.Sscanf(name, "frame_%d_", &sourceFrame); err == nil && sourceFrame > 0 {
 			crops[sourceFrame] = path
+			frames = append(frames, sourceFrame)
 		}
 	}
-	return crops
+	sort.Ints(frames)
+	return crops, frames
+}
+
+func lookupObjectCropPath(overlay *playbackOverlay, sourceFrame int) string {
+	if overlay == nil || overlay.CropBySourceFrame == nil || sourceFrame <= 0 {
+		return ""
+	}
+	if path := overlay.CropBySourceFrame[sourceFrame]; path != "" {
+		return path
+	}
+	for i := len(overlay.CropSourceFrames) - 1; i >= 0; i-- {
+		frame := overlay.CropSourceFrames[i]
+		if frame > sourceFrame {
+			continue
+		}
+		return overlay.CropBySourceFrame[frame]
+	}
+	return ""
 }
 
 func newObjectMapCanvas(frame gocv.Mat) (*image.RGBA, error) {

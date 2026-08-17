@@ -152,10 +152,11 @@ func updateTracks(
 	for {
 		bestTrack := -1
 		bestDetection := -1
-		bestDistance := math.MaxFloat64
+		bestScore := math.MaxFloat64
 
-		// Greedy nearest-neighbor association is enough here because the scenes
-		// are sparse and the targets are expected to be small and fast.
+		// Prefer detections that stay close to the predicted motion, overlap the
+		// previous box, and keep roughly the same scale. This keeps one aircraft
+		// from hopping to a nearby fragment or noise blob when the mask wobbles.
 		for ti, track := range tracks {
 			if trackMatched[ti] {
 				continue
@@ -174,12 +175,9 @@ func updateTracks(
 					continue
 				}
 
-				dx := float64(detection.Center.X) - predictedX
-				dy := float64(detection.Center.Y) - predictedY
-				distance := math.Hypot(dx, dy)
-
-				if distance < bestDistance && distance <= settings.MaxMatchDistance {
-					bestDistance = distance
+				score, ok := scoreTrackDetectionMatch(track, detection, predictedX, predictedY, settings)
+				if ok && score < bestScore {
+					bestScore = score
 					bestTrack = ti
 					bestDetection = di
 				}
@@ -261,6 +259,57 @@ func updateTracks(
 	}
 
 	return tracks, nextTrackID
+}
+
+func scoreTrackDetectionMatch(track *Track, detection Detection, predictedX, predictedY float64, settings TrackingSettings) (float64, bool) {
+	dx := float64(detection.Center.X) - predictedX
+	dy := float64(detection.Center.Y) - predictedY
+	distance := math.Hypot(dx, dy)
+	if distance > settings.MaxMatchDistance {
+		return 0, false
+	}
+
+	trackArea := float64(track.Rect.Dx() * track.Rect.Dy())
+	detectionArea := float64(detection.Rect.Dx() * detection.Rect.Dy())
+	if trackArea <= 0 || detectionArea <= 0 {
+		return 0, false
+	}
+
+	areaRatio := detectionArea / trackArea
+	if areaRatio < 1 {
+		areaRatio = 1 / areaRatio
+	}
+
+	iou := rectIOU(track.Rect, detection.Rect)
+
+	// Once a track is established, reject candidates whose size changes too
+	// violently unless the boxes still overlap enough to justify the jump.
+	if track.Hits >= settings.MinHits*2 && areaRatio > 4.0 && iou < 0.08 {
+		return 0, false
+	}
+
+	distanceScore := distance / settings.MaxMatchDistance
+	sizePenalty := math.Max(0, areaRatio-1.0) * 0.20
+	overlapBonus := iou * 0.85
+
+	return distanceScore + sizePenalty - overlapBonus, true
+}
+
+func rectIOU(a, b image.Rectangle) float64 {
+	intersection := a.Intersect(b)
+	if intersection.Empty() {
+		return 0
+	}
+
+	intersectionArea := float64(intersection.Dx() * intersection.Dy())
+	aArea := float64(a.Dx() * a.Dy())
+	bArea := float64(b.Dx() * b.Dy())
+	unionArea := aArea + bArea - intersectionArea
+	if unionArea <= 0 {
+		return 0
+	}
+
+	return intersectionArea / unionArea
 }
 
 // makeFrameMetadata filters the active tracks down to the ones considered

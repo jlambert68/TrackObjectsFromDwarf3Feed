@@ -175,7 +175,7 @@ func startEvent(
 			return nil, fmt.Errorf("read buffered mask %s", bf.MaskPath)
 		}
 
-		if err := recorder.RecordFrame(frame, mask, bf.Metadata); err != nil {
+		if err := recorder.RecordFrame(frame, mask, nil, bf.Metadata); err != nil {
 			frame.Close()
 			mask.Close()
 			_ = recorder.closeWriters()
@@ -191,7 +191,7 @@ func startEvent(
 
 // RecordFrame writes one raw frame, creates the annotated tracked frame, and
 // appends the JSON metadata for that frame.
-func (r *EventRecorder) RecordFrame(clean gocv.Mat, mask gocv.Mat, meta FrameMetadata) error {
+func (r *EventRecorder) RecordFrame(clean gocv.Mat, mask gocv.Mat, tracks []*Track, meta FrameMetadata) error {
 	meta.TimeMS = time.Unix(0, meta.TimeUnixNS).Sub(r.StartedAt).Milliseconds()
 
 	if err := r.RawWriter.Write(clean); err != nil {
@@ -215,7 +215,11 @@ func (r *EventRecorder) RecordFrame(clean gocv.Mat, mask gocv.Mat, meta FrameMet
 		return fmt.Errorf("write masked video: %w", err)
 	}
 
-	if err := r.saveTrackCrops(clean, meta); err != nil {
+	if len(tracks) > 0 {
+		if err := r.saveTrackCropsForTracks(clean, tracks, meta); err != nil {
+			return err
+		}
+	} else if err := r.saveTrackCrops(clean, meta); err != nil {
 		return err
 	}
 
@@ -291,6 +295,42 @@ func (r *EventRecorder) saveTrackCrops(frame gocv.Mat, meta FrameMetadata) error
 			track.BoxY+track.BoxHeight,
 		)
 		rect = expandedTrackCropRect(rect).Intersect(frameBounds)
+		if rect.Empty() {
+			continue
+		}
+
+		objectDir := filepath.Join(root, fmt.Sprintf("object_%04d", track.ID))
+		if err := os.MkdirAll(objectDir, 0755); err != nil {
+			return fmt.Errorf("create track crop directory: %w", err)
+		}
+
+		crop := frame.Region(rect)
+		filename := filepath.Join(objectDir,
+			fmt.Sprintf("frame_%06d_%09dms.jpg", meta.SourceFrame, meta.TimeMS))
+		if ok := gocv.IMWrite(filename, crop); !ok {
+			crop.Close()
+			return fmt.Errorf("save track crop %s", filename)
+		}
+		crop.Close()
+	}
+
+	return nil
+}
+
+func (r *EventRecorder) saveTrackCropsForTracks(frame gocv.Mat, tracks []*Track, meta FrameMetadata) error {
+	if frame.Empty() || len(tracks) == 0 {
+		return nil
+	}
+
+	root := filepath.Join(r.Directory, "track_crops")
+	frameBounds := image.Rect(0, 0, frame.Cols(), frame.Rows())
+
+	for _, track := range tracks {
+		if track == nil || track.Hits < r.Settings.MinHits || track.Missed > 0 || track.Rect.Empty() {
+			continue
+		}
+
+		rect := expandedTrackCropRect(track.Rect).Intersect(frameBounds)
 		if rect.Empty() {
 			continue
 		}
