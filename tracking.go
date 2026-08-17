@@ -376,7 +376,7 @@ func classifyTrack(t *Track, settings TrackingSettings) (string, bool) {
 func hasFreshInterestingTracks(tracks []*Track, settings TrackingSettings) bool {
 	for _, track := range tracks {
 		trackType, ok := classifyTrack(track, settings)
-		if ok && trackType == trackTypeFast && track.Missed == 0 {
+		if ok && (trackType == trackTypeFast || trackType == trackTypeSlow) && track.Missed == 0 {
 			return true
 		}
 	}

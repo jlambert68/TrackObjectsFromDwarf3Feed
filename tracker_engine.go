@@ -92,6 +92,15 @@ type TrackerEngine struct {
 	Stop   <-chan struct{}
 }
 
+func (e *TrackerEngine) effectiveSettings() TrackingSettings {
+	settings := NormalizeTrackingSettings(e.Config.Settings)
+	if e.Config.InputLabel == "DWARF 3 live stream" {
+		settings.PreEventDuration = 3 * time.Second
+		settings.PostEventDuration = 3 * time.Second
+	}
+	return settings
+}
+
 // Run executes the tracker until the input ends, the caller asks it to stop,
 // or an error occurs.
 func (e *TrackerEngine) Run() error {
@@ -133,6 +142,7 @@ func (e *TrackerEngine) Run() error {
 	defer openKernel.Close()
 	dilateKernel := gocv.GetStructuringElement(gocv.MorphEllipse, image.Pt(5, 5))
 	defer dilateKernel.Close()
+	settings := e.effectiveSettings()
 
 	var tracks []*Track
 	var buffer []BufferedFrame
@@ -177,13 +187,13 @@ func (e *TrackerEngine) Run() error {
 		if err := gocv.CvtColor(frame, &gray, gocv.ColorBGRToGray); err != nil {
 			continue
 		}
-		if err := gocv.GaussianBlur(gray, &blurred, image.Pt(e.Config.Settings.BlurSize, e.Config.Settings.BlurSize), 0, 0, gocv.BorderDefault); err != nil {
+		if err := gocv.GaussianBlur(gray, &blurred, image.Pt(settings.BlurSize, settings.BlurSize), 0, 0, gocv.BorderDefault); err != nil {
 			continue
 		}
 		if err := background.Apply(blurred, &mask); err != nil {
 			continue
 		}
-		gocv.Threshold(mask, &cleanMask, float32(e.Config.Settings.ForegroundThreshold), 255, gocv.ThresholdBinary)
+		gocv.Threshold(mask, &cleanMask, float32(settings.ForegroundThreshold), 255, gocv.ThresholdBinary)
 		if err := gocv.MorphologyEx(cleanMask, &cleanMask, gocv.MorphOpen, openKernel); err != nil {
 			continue
 		}
@@ -191,15 +201,15 @@ func (e *TrackerEngine) Run() error {
 			continue
 		}
 
-		trackingROI := trackingROIForSize(frame.Cols(), frame.Rows(), e.Config.Settings)
+		trackingROI := trackingROIForSize(frame.Cols(), frame.Rows(), settings)
 		applyTrackingROI(&cleanMask, trackingROI)
 
-		detections := findDetections(cleanMask, e.Config.Settings)
-		tracks, nextTrackID = updateTracks(tracks, detections, now, frameDT, nextTrackID, e.Config.Settings)
+		detections := findDetections(cleanMask, settings)
+		tracks, nextTrackID = updateTracks(tracks, detections, now, frameDT, nextTrackID, settings)
 		tracks = filterTracksToROI(tracks, trackingROI)
 
-		meta := makeFrameMetadata(sourceFrame, firstFrameTime, now, tracks, e.Config.Settings)
-		interesting := hasFreshInterestingTracks(tracks, e.Config.Settings)
+		meta := makeFrameMetadata(sourceFrame, firstFrameTime, now, tracks, settings)
+		interesting := hasFreshInterestingTracks(tracks, settings)
 
 		if interesting {
 			lastInteresting = now
@@ -212,10 +222,10 @@ func (e *TrackerEngine) Run() error {
 				return err
 			}
 			buffer = append(buffer, bufferedFrame)
-			buffer = trimBuffer(buffer, now.Add(-e.Config.Settings.PreEventDuration))
+			buffer = trimBuffer(buffer, now.Add(-settings.PreEventDuration))
 
 			if interesting {
-				recorder, err = startEvent(e.Config.OutputDir, fps, frame.Cols(), frame.Rows(), buffer, e.Config.Settings)
+				recorder, err = startEvent(e.Config.OutputDir, fps, frame.Cols(), frame.Rows(), buffer, settings)
 				if err != nil {
 					closeBuffer(buffer)
 					return err
@@ -235,7 +245,7 @@ func (e *TrackerEngine) Run() error {
 				return err
 			}
 
-			if !lastInteresting.IsZero() && now.Sub(lastInteresting) >= e.Config.Settings.PostEventDuration {
+			if !lastInteresting.IsZero() && now.Sub(lastInteresting) >= settings.PostEventDuration {
 				dir := recorder.Directory
 				if err := recorder.Finish(now); err != nil {
 					return err
@@ -256,7 +266,7 @@ func (e *TrackerEngine) Run() error {
 		if e.Config.InputLabel == "video file" {
 			totalFrames = int(math.Round(capture.Get(gocv.VideoCaptureFrameCount)))
 		}
-		update := buildFrameUpdate(frame, cleanMask, tracks, meta, len(detections), recorder != nil, sourceFrame < int(fps*3), e.Config.ShowMask, e.Config.Settings, fps, totalFrames)
+		update := buildFrameUpdate(frame, cleanMask, tracks, meta, len(detections), recorder != nil, sourceFrame < int(fps*3), e.Config.ShowMask, settings, fps, totalFrames)
 		err = e.emitFrame(update, now)
 		update.Close()
 		if err != nil {
