@@ -8,6 +8,8 @@ import (
 	"gocv.io/x/gocv"
 )
 
+const maxMissedFrames = 2
+
 // findDetections converts the cleaned foreground mask into bounding boxes and
 // centers that can be handed to the tracker.
 func findDetections(mask gocv.Mat, settings TrackingSettings) []Detection {
@@ -39,7 +41,98 @@ func findDetections(mask gocv.Mat, settings TrackingSettings) []Detection {
 		})
 	}
 
-	return detections
+	return mergeNearbyDetections(detections, settings)
+}
+
+func mergeNearbyDetections(detections []Detection, settings TrackingSettings) []Detection {
+	if len(detections) < 2 {
+		return detections
+	}
+
+	merged := append([]Detection(nil), detections...)
+	for {
+		changed := false
+
+		for i := 0; i < len(merged); i++ {
+			for j := i + 1; j < len(merged); j++ {
+				if !shouldMergeDetections(merged[i], merged[j], settings) {
+					continue
+				}
+
+				merged[i] = mergeDetectionPair(merged[i], merged[j])
+				merged = append(merged[:j], merged[j+1:]...)
+				changed = true
+				break
+			}
+			if changed {
+				break
+			}
+		}
+
+		if !changed {
+			return merged
+		}
+	}
+}
+
+func shouldMergeDetections(a, b Detection, settings TrackingSettings) bool {
+	aRect := a.Rect
+	bRect := b.Rect
+	if aRect.Empty() || bRect.Empty() {
+		return false
+	}
+
+	hGap := rectAxisGap(aRect.Min.X, aRect.Max.X, bRect.Min.X, bRect.Max.X)
+	vGap := rectAxisGap(aRect.Min.Y, aRect.Max.Y, bRect.Min.Y, bRect.Max.Y)
+
+	maxWidth := maxInt(aRect.Dx(), bRect.Dx())
+	maxHeight := maxInt(aRect.Dy(), bRect.Dy())
+
+	// Nearby mask fragments from one aircraft should be fused into one
+	// detection before track association, otherwise the recorder saves partial
+	// crops for separate track IDs.
+	maxHorizontalGap := maxInt(24, maxWidth/2)
+	maxVerticalGap := maxInt(12, maxHeight)
+
+	if hGap > maxHorizontalGap || vGap > maxVerticalGap {
+		return false
+	}
+
+	union := aRect.Union(bRect)
+	if float64(union.Dx()*union.Dy()) > settings.MaxArea*1.5 {
+		return false
+	}
+
+	return true
+}
+
+func mergeDetectionPair(a, b Detection) Detection {
+	rect := a.Rect.Union(b.Rect)
+	return Detection{
+		Rect: rect,
+		Center: image.Pt(
+			(rect.Min.X+rect.Max.X)/2,
+			(rect.Min.Y+rect.Max.Y)/2,
+		),
+		Area: a.Area + b.Area,
+	}
+}
+
+func rectAxisGap(aMin, aMax, bMin, bMax int) int {
+	if aMax < bMin {
+		return bMin - aMax
+	}
+	if bMax < aMin {
+		return aMin - bMax
+	}
+	return 0
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // updateTracks matches detections to existing tracks by nearest predicted
@@ -141,6 +234,15 @@ func updateTracks(
 		}
 	}
 
+	activeTracks := tracks[:0]
+	for _, track := range tracks {
+		if track.Missed > maxMissedFrames {
+			continue
+		}
+		activeTracks = append(activeTracks, track)
+	}
+	tracks = activeTracks
+
 	for i, detection := range detections {
 		if detectionUsed[i] {
 			continue
@@ -172,6 +274,10 @@ func makeFrameMetadata(sourceFrame int, start, now time.Time, tracks []*Track, s
 	}
 
 	for _, t := range tracks {
+		if t.Missed > 0 {
+			continue
+		}
+
 		trackType, ok := classifyTrack(t, settings)
 		if t.Hits < settings.MinHits || !ok {
 			continue

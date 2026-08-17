@@ -3,6 +3,7 @@ package main
 import (
 	"image"
 	"image/color"
+	"os"
 	"time"
 
 	"gocv.io/x/gocv"
@@ -206,8 +207,8 @@ type EventMetadata struct {
 // BufferedFrame is one pre-event frame kept in RAM so recording can include
 // context before the first fast object is detected.
 type BufferedFrame struct {
-	Image     gocv.Mat
-	Mask      gocv.Mat
+	ImagePath string
+	MaskPath  string
 	Timestamp time.Time
 	Metadata  FrameMetadata
 }
@@ -218,6 +219,7 @@ type EventRecorder struct {
 	RawWriter     *gocv.VideoWriter
 	TrackedWriter *gocv.VideoWriter
 	MaskedWriter  *gocv.VideoWriter
+	TrackingFile  *os.File
 
 	Directory string
 	StartedAt time.Time
@@ -225,8 +227,11 @@ type EventRecorder struct {
 	Width     int
 	Height    int
 
-	Metadata EventMetadata
-	SeenIDs  map[int]struct{}
+	EventID            string
+	SeenIDs            map[int]struct{}
+	FramesWritten      int
+	TrackingFrameCount int
+	TrackingStreamOpen bool
 
 	HighestSpeed float64
 	Settings     TrackingSettings

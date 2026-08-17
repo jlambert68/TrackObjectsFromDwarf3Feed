@@ -7,6 +7,7 @@ import (
 	"image"
 	"image/color"
 	"image/draw"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -70,15 +71,18 @@ type trackerApp struct {
 	restoreSettingsButton *widget.Button
 	watchObjectButton     *widget.Button
 	saveObjectNameButton  *widget.Button
+	playPauseButton       *widget.Button
 
 	videoImage     *canvas.Image
 	maskImage      *canvas.Image
 	objectImage    *canvas.Image
 	objectMapImage *canvas.Image
 	tabs           *container.AppTabs
+	playbackSlider *widget.Slider
 
 	statusLabel        *widget.Label
 	eventLabel         *widget.Label
+	playbackLabel      *widget.Label
 	historyList        *widget.List
 	historyInfo        *widget.Label
 	historyDetail      *widget.Entry
@@ -94,9 +98,16 @@ type trackerApp struct {
 	currentDetail     *eventHistoryDetail
 	presets           map[string]TrackingSettings
 
-	mu      sync.Mutex
-	running bool
-	stopCh  chan struct{}
+	mu                   sync.Mutex
+	running              bool
+	stopCh               chan struct{}
+	playbackActive       bool
+	playbackPaused       bool
+	playbackSeekFrame    int
+	playbackCurrentFrame int
+	playbackTotalFrames  int
+	playbackFPS          float64
+	updatingPlaybackUI   bool
 }
 
 type eventHistoryEntry struct {
@@ -273,8 +284,13 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 	objectMapImage.FillMode = canvas.ImageFillContain
 	objectMapImage.SetMinSize(fyne.NewSize(480, 270))
 
+	playbackSlider := widget.NewSlider(0, 1)
+	playbackSlider.Step = 1
+	playbackSlider.Disable()
+
 	historyInfo := widget.NewLabel("Select an event")
 	historyInfo.Wrapping = fyne.TextWrapWord
+	playbackLabel := widget.NewLabel("00:00 / 00:00")
 	historyDetail := widget.NewMultiLineEntry()
 	historyDetail.SetText("Select an event to inspect event.json and tracking.json.")
 	historyDetail.Disable()
@@ -359,8 +375,10 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 		maskImage:                maskImage,
 		objectImage:              objectImage,
 		objectMapImage:           objectMapImage,
+		playbackSlider:           playbackSlider,
 		statusLabel:              widget.NewLabel("Idle"),
 		eventLabel:               widget.NewLabel("No event yet"),
+		playbackLabel:            playbackLabel,
 		historyInfo:              historyInfo,
 		historyDetail:            historyDetail,
 		objectList:               objectList,
@@ -369,6 +387,7 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 		objectMapSkipEntry:       objectMapSkipEntry,
 		selectedHistory:          -1,
 		presets:                  make(map[string]TrackingSettings),
+		playbackSeekFrame:        -1,
 	}
 
 	ui.fileButton = widget.NewButtonWithIcon("", theme.FolderOpenIcon(), ui.pickVideoFile)
@@ -391,6 +410,7 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 	ui.restoreSettingsButton = widget.NewButtonWithIcon("Restore Settings", theme.ViewRefreshIcon(), ui.restoreSettingsFromSelectedEvent)
 	ui.watchObjectButton = widget.NewButtonWithIcon("Watch Object", theme.MediaPlayIcon(), ui.watchSelectedObject)
 	ui.saveObjectNameButton = widget.NewButtonWithIcon("Save Name", theme.DocumentSaveIcon(), ui.saveSelectedObjectName)
+	ui.playPauseButton = widget.NewButtonWithIcon("Pause", theme.MediaPauseIcon(), ui.togglePlaybackPause)
 	ui.stopButton.Disable()
 	ui.openTrackedButton.Disable()
 	ui.openOriginalButton.Disable()
@@ -399,6 +419,7 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 	ui.saveObjectNameButton.Disable()
 	ui.applyPresetButton.Disable()
 	ui.deletePresetButton.Disable()
+	ui.playPauseButton.Disable()
 
 	ui.sourceRadio.OnChanged = func(string) {
 		ui.refreshSourceControls()
@@ -474,11 +495,18 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 		ui.selectedObjectID = ui.currentDetail.Objects[id].ID
 		ui.updateSelectedObject()
 	}
+	ui.playbackSlider.OnChanged = func(value float64) {
+		ui.handlePlaybackSliderChanged(value)
+	}
+	ui.playbackSlider.OnChangeEnded = func(value float64) {
+		ui.handlePlaybackSliderChanged(value)
+	}
 
 	ui.loadTrackingPreferences()
 	ui.loadTrackingPresets()
 	ui.loadHistoryPreferences()
 	ui.refreshEventHistory()
+	ui.resetPlaybackControls()
 
 	return ui
 }
@@ -541,10 +569,18 @@ func (ui *trackerApp) buildUI() fyne.CanvasObject {
 		ui.eventLabel,
 	)
 
+	playbackControls := container.NewBorder(
+		nil,
+		nil,
+		ui.playPauseButton,
+		ui.playbackLabel,
+		ui.playbackSlider,
+	)
+
 	trackedPanel := container.NewHSplit(
 		container.NewBorder(
 			widget.NewLabelWithStyle("Tracked Replay", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-			nil,
+			playbackControls,
 			nil,
 			nil,
 			container.NewPadded(ui.videoImage),
@@ -692,6 +728,172 @@ func (ui *trackerApp) stopTracking() {
 	ui.statusLabel.SetText("Stopping tracker...")
 }
 
+func (ui *trackerApp) togglePlaybackPause() {
+	ui.mu.Lock()
+	defer ui.mu.Unlock()
+
+	if !ui.playbackActive {
+		return
+	}
+
+	ui.playbackPaused = !ui.playbackPaused
+	paused := ui.playbackPaused
+	label := "Pause"
+	icon := theme.MediaPauseIcon()
+	status := "Playing"
+	if paused {
+		label = "Resume"
+		icon = theme.MediaPlayIcon()
+		status = "Paused"
+	}
+	ui.playPauseButton.SetText(label)
+	ui.playPauseButton.SetIcon(icon)
+	ui.statusLabel.SetText(fmt.Sprintf("%s %s", status, ui.currentPlaybackLabelLocked()))
+}
+
+func (ui *trackerApp) handlePlaybackSliderChanged(value float64) {
+	ui.mu.Lock()
+	defer ui.mu.Unlock()
+
+	if ui.updatingPlaybackUI {
+		return
+	}
+
+	frame := int(math.Round(value))
+	if frame < 0 {
+		frame = 0
+	}
+	if ui.playbackTotalFrames > 0 && frame >= ui.playbackTotalFrames {
+		frame = ui.playbackTotalFrames - 1
+	}
+
+	ui.playbackCurrentFrame = frame
+	ui.playbackLabel.SetText(ui.formatPlaybackLabelLocked())
+
+	if !ui.playbackActive {
+		return
+	}
+
+	ui.playbackPaused = true
+	ui.playbackSeekFrame = frame
+	ui.playPauseButton.SetText("Resume")
+	ui.playPauseButton.SetIcon(theme.MediaPlayIcon())
+	ui.statusLabel.SetText(fmt.Sprintf("Paused %s", ui.currentPlaybackLabelLocked()))
+}
+
+func (ui *trackerApp) resetPlaybackControls() {
+	ui.mu.Lock()
+	ui.playbackActive = false
+	ui.playbackPaused = false
+	ui.playbackSeekFrame = -1
+	ui.playbackCurrentFrame = 0
+	ui.playbackTotalFrames = 0
+	ui.playbackFPS = 0
+	ui.mu.Unlock()
+
+	ui.updatingPlaybackUI = true
+	ui.playbackSlider.Min = 0
+	ui.playbackSlider.Max = 1
+	ui.playbackSlider.Step = 1
+	ui.playbackSlider.SetValue(0)
+	ui.updatingPlaybackUI = false
+	ui.playbackSlider.Disable()
+	ui.playPauseButton.SetText("Pause")
+	ui.playPauseButton.SetIcon(theme.MediaPauseIcon())
+	ui.playPauseButton.Disable()
+	ui.playbackLabel.SetText("00:00 / 00:00")
+}
+
+func (ui *trackerApp) startPlaybackControls(totalFrames int, fps float64) {
+	if totalFrames < 1 {
+		totalFrames = 1
+	}
+	if fps <= 0 {
+		fps = 30
+	}
+
+	ui.mu.Lock()
+	ui.playbackActive = true
+	ui.playbackPaused = false
+	ui.playbackSeekFrame = -1
+	ui.playbackCurrentFrame = 0
+	ui.playbackTotalFrames = totalFrames
+	ui.playbackFPS = fps
+	label := ui.formatPlaybackLabelLocked()
+	ui.mu.Unlock()
+
+	ui.updatingPlaybackUI = true
+	ui.playbackSlider.Min = 0
+	ui.playbackSlider.Max = float64(totalFrames - 1)
+	ui.playbackSlider.Step = 1
+	ui.playbackSlider.SetValue(0)
+	ui.updatingPlaybackUI = false
+	ui.playbackSlider.Enable()
+	ui.playPauseButton.SetText("Pause")
+	ui.playPauseButton.SetIcon(theme.MediaPauseIcon())
+	ui.playPauseButton.Enable()
+	ui.playbackLabel.SetText(label)
+}
+
+func (ui *trackerApp) updatePlaybackFrame(frameIndex int, fps float64) {
+	if frameIndex < 0 {
+		frameIndex = 0
+	}
+	ui.mu.Lock()
+	if ui.playbackTotalFrames > 0 && frameIndex >= ui.playbackTotalFrames {
+		frameIndex = ui.playbackTotalFrames - 1
+	}
+	ui.playbackCurrentFrame = frameIndex
+	label := ui.formatPlaybackLabelLocked()
+	status := "Playing"
+	if ui.playbackPaused {
+		status = "Paused"
+	}
+	playbackStatus := ui.currentPlaybackLabelLocked()
+	ui.mu.Unlock()
+
+	ui.updatingPlaybackUI = true
+	ui.playbackSlider.SetValue(float64(frameIndex))
+	ui.updatingPlaybackUI = false
+	ui.playbackLabel.SetText(label)
+	ui.statusLabel.SetText(fmt.Sprintf("%s %s at %.3f FPS", status, playbackStatus, fps))
+}
+
+func (ui *trackerApp) currentPlaybackState() (paused bool, seekFrame int) {
+	ui.mu.Lock()
+	defer ui.mu.Unlock()
+
+	paused = ui.playbackPaused
+	seekFrame = ui.playbackSeekFrame
+	ui.playbackSeekFrame = -1
+	return paused, seekFrame
+}
+
+func (ui *trackerApp) currentPlaybackLabelLocked() string {
+	totalFrames := ui.playbackTotalFrames
+	if totalFrames < 1 {
+		totalFrames = 1
+	}
+	return fmt.Sprintf("frame %d/%d   %s", ui.playbackCurrentFrame+1, totalFrames, ui.formatPlaybackLabelLocked())
+}
+
+func (ui *trackerApp) formatPlaybackLabelLocked() string {
+	if ui.playbackTotalFrames <= 0 {
+		return "00:00 / 00:00"
+	}
+	fps := ui.playbackFPS
+	if fps <= 0 {
+		fps = 30
+	}
+	current := time.Duration(float64(ui.playbackCurrentFrame) * float64(time.Second) / fps)
+	totalFrames := ui.playbackTotalFrames - 1
+	if totalFrames < 0 {
+		totalFrames = 0
+	}
+	total := time.Duration(float64(totalFrames) * float64(time.Second) / fps)
+	return fmt.Sprintf("%s / %s", formatVideoProgressDuration(current), formatVideoProgressDuration(total))
+}
+
 func (ui *trackerApp) buildConfig() (TrackerConfig, error) {
 	fallbackFPS, err := strconv.ParseFloat(ui.fpsEntry.Text, 64)
 	if err != nil || fallbackFPS <= 0 {
@@ -751,7 +953,14 @@ func (ui *trackerApp) runTracker(config TrackerConfig, stopCh chan struct{}) {
 		Hooks: TrackerHooks{
 			OnReady: func(ready TrackerReady) error {
 				fyne.Do(func() {
-					ui.statusLabel.SetText(fmt.Sprintf("Running %s at %.3f FPS (%dx%d)", ready.InputLabel, ready.FPS, ready.Width, ready.Height))
+					statusText := fmt.Sprintf("Running %s at %.3f FPS (%dx%d)", ready.InputLabel, ready.FPS, ready.Width, ready.Height)
+					if ready.HasFixedLength {
+						statusText = fmt.Sprintf("%s   video length %s   %d frames",
+							statusText,
+							formatVideoProgressDuration(ready.Duration),
+							ready.TotalFrames)
+					}
+					ui.statusLabel.SetText(statusText)
 				})
 				return nil
 			},
@@ -783,6 +992,9 @@ func (ui *trackerApp) runTracker(config TrackerConfig, stopCh chan struct{}) {
 				}
 
 				statusText := update.StatusText
+				if update.ProgressText != "" {
+					statusText += "   " + update.ProgressText
+				}
 				if update.Recording {
 					statusText += "   recording"
 				}
@@ -849,6 +1061,13 @@ func (ui *trackerApp) runPlayback(path, label, maskPath string, stopCh chan stru
 	if frameDelay <= 0 {
 		frameDelay = time.Second / 30
 	}
+	totalFrames := int(math.Round(capture.Get(gocv.VideoCaptureFrameCount)))
+	if totalFrames <= 0 && overlay != nil && len(overlay.Tracking.Frames) > 0 {
+		totalFrames = len(overlay.Tracking.Frames)
+	}
+	if totalFrames <= 0 {
+		totalFrames = 1
+	}
 
 	frame := gocv.NewMat()
 	defer frame.Close()
@@ -858,10 +1077,13 @@ func (ui *trackerApp) runPlayback(path, label, maskPath string, stopCh chan stru
 	defer cropFrame.Close()
 	var overlayFrame gocv.Mat
 	var objectMapCanvas *image.RGBA
+	var lastObjectImage image.Image
 	objectMapSeen := 0
 	frameIndex := 0
+	placeholder := newPlaceholderFrame()
 
 	fyne.Do(func() {
+		ui.startPlaybackControls(totalFrames, fps)
 		ui.statusLabel.SetText(fmt.Sprintf("Playing %s at %.3f FPS", label, fps))
 		ui.eventLabel.SetText(path)
 		ui.tabs.SelectIndex(0)
@@ -875,6 +1097,27 @@ func (ui *trackerApp) runPlayback(path, label, maskPath string, stopCh chan stru
 			})
 			return
 		default:
+		}
+
+		paused, seekFrame := ui.currentPlaybackState()
+		if seekFrame >= 0 {
+			if seekFrame >= totalFrames {
+				seekFrame = totalFrames - 1
+			}
+			if seekFrame < 0 {
+				seekFrame = 0
+			}
+			frameIndex = seekFrame
+			objectMapCanvas = nil
+			objectMapSeen = 0
+			lastObjectImage = nil
+			capture.Set(gocv.VideoCapturePosFrames, float64(frameIndex))
+			if maskCapture != nil {
+				maskCapture.Set(gocv.VideoCapturePosFrames, float64(frameIndex))
+			}
+		} else if paused {
+			time.Sleep(30 * time.Millisecond)
+			continue
 		}
 
 		if ok := capture.Read(&frame); !ok || frame.Empty() {
@@ -893,8 +1136,10 @@ func (ui *trackerApp) runPlayback(path, label, maskPath string, stopCh chan stru
 		}
 
 		displayMat := frame
+		hasOverlayFrame := false
 		if overlay != nil && frameIndex < len(overlay.Tracking.Frames) {
 			overlayFrame = frame.Clone()
+			hasOverlayFrame = true
 			tracks := overlay.Tracking.Frames[frameIndex].Tracks
 			if overlay.SelectedTrackID > 0 {
 				tracks = filterTrackMetadataByID(tracks, overlay.SelectedTrackID)
@@ -904,7 +1149,7 @@ func (ui *trackerApp) runPlayback(path, label, maskPath string, stopCh chan stru
 		}
 
 		displayImage, err := displayMat.ToImage()
-		if &displayMat == &overlayFrame {
+		if hasOverlayFrame {
 			overlayFrame.Close()
 		}
 		if err != nil {
@@ -913,6 +1158,7 @@ func (ui *trackerApp) runPlayback(path, label, maskPath string, stopCh chan stru
 			})
 			return
 		}
+		displayImage = cloneImage(displayImage)
 
 		var maskImage image.Image
 		if maskCapture != nil {
@@ -924,6 +1170,7 @@ func (ui *trackerApp) runPlayback(path, label, maskPath string, stopCh chan stru
 					})
 					return
 				}
+				maskImage = cloneImage(maskImage)
 			}
 		}
 
@@ -936,6 +1183,9 @@ func (ui *trackerApp) runPlayback(path, label, maskPath string, stopCh chan stru
 				cropFrame = gocv.IMRead(cropPath, gocv.IMReadColor)
 				if !cropFrame.Empty() {
 					objectImage, err = cropFrame.ToImage()
+					if err == nil {
+						objectImage = cloneImage(objectImage)
+					}
 					if err == nil && objectMapCanvas != nil {
 						if objectMapSeen%(overlay.ObjectMapSkipCount+1) == 0 {
 							maskCropImage, maskErr := extractObjectMaskImage(maskFrame, selectedTrack)
@@ -957,36 +1207,43 @@ func (ui *trackerApp) runPlayback(path, label, maskPath string, stopCh chan stru
 				}
 			}
 		}
+		if objectImage != nil {
+			lastObjectImage = objectImage
+		}
 
+		done := make(chan struct{})
 		fyne.Do(func() {
 			ui.videoImage.Image = displayImage
 			ui.videoImage.Refresh()
 			if maskImage != nil {
 				ui.maskImage.Image = maskImage
 			} else {
-				ui.maskImage.Image = newPlaceholderFrame()
+				ui.maskImage.Image = placeholder
 			}
 			ui.maskImage.Refresh()
 			if objectImage != nil {
 				ui.objectImage.Image = objectImage
+			} else if lastObjectImage != nil {
+				ui.objectImage.Image = lastObjectImage
 			} else {
-				ui.objectImage.Image = newPlaceholderFrame()
+				ui.objectImage.Image = placeholder
 			}
 			ui.objectImage.Refresh()
 			if objectMapCanvas != nil {
 				ui.objectMapImage.Image = objectMapCanvas
 			} else {
-				ui.objectMapImage.Image = newPlaceholderFrame()
+				ui.objectMapImage.Image = placeholder
 			}
 			ui.objectMapImage.Refresh()
-			playbackLabel := label
-			if overlay != nil && overlay.Label != "" {
-				playbackLabel = overlay.Label
-			}
-			ui.statusLabel.SetText(fmt.Sprintf("Playing %s", playbackLabel))
+			ui.updatePlaybackFrame(frameIndex, fps)
+			close(done)
 		})
+		<-done
 
 		frameIndex++
+		if paused || seekFrame >= 0 {
+			continue
+		}
 		time.Sleep(frameDelay)
 	}
 
@@ -1003,6 +1260,7 @@ func (ui *trackerApp) finishRun(err error, idleText string) {
 
 	ui.startButton.Enable()
 	ui.stopButton.Disable()
+	ui.resetPlaybackControls()
 
 	switch {
 	case err == nil || errors.Is(err, ErrStopTracking):
@@ -2355,4 +2613,15 @@ func newPlaceholderFrame() image.Image {
 		}
 	}
 	return img
+}
+
+func cloneImage(src image.Image) image.Image {
+	if src == nil {
+		return nil
+	}
+
+	bounds := src.Bounds()
+	dst := image.NewRGBA(bounds)
+	draw.Draw(dst, bounds, src, bounds.Min, draw.Src)
+	return dst
 }

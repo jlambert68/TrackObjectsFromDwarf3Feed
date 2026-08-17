@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"image"
 	"math"
+	"os"
 	"time"
 
 	"gocv.io/x/gocv"
@@ -24,11 +25,14 @@ type TrackerConfig struct {
 
 // TrackerReady reports source properties once the input stream has opened.
 type TrackerReady struct {
-	Input      string
-	InputLabel string
-	FPS        float64
-	Width      int
-	Height     int
+	Input          string
+	InputLabel     string
+	FPS            float64
+	Width          int
+	Height         int
+	TotalFrames    int
+	Duration       time.Duration
+	HasFixedLength bool
 }
 
 // FrameUpdate is one rendered tracker snapshot suitable for a CLI preview or a
@@ -44,6 +48,11 @@ type FrameUpdate struct {
 	Recording          bool
 	LearningBackground bool
 	StatusText         string
+	ProgressText       string
+	Elapsed            time.Duration
+	TotalDuration      time.Duration
+	Progress           float64
+	HasFixedLength     bool
 	Display            gocv.Mat
 	Mask               gocv.Mat
 
@@ -128,6 +137,11 @@ func (e *TrackerEngine) Run() error {
 	var tracks []*Track
 	var buffer []BufferedFrame
 	var recorder *EventRecorder
+	bufferDir, err := os.MkdirTemp("", "trackobject-buffer-*")
+	if err != nil {
+		return fmt.Errorf("create frame spool directory: %w", err)
+	}
+	defer os.RemoveAll(bufferDir)
 
 	nextTrackID := 1
 	sourceFrame := 0
@@ -192,12 +206,12 @@ func (e *TrackerEngine) Run() error {
 		}
 
 		if recorder == nil {
-			buffer = append(buffer, BufferedFrame{
-				Image:     frame.Clone(),
-				Mask:      cleanMask.Clone(),
-				Timestamp: now,
-				Metadata:  meta,
-			})
+			bufferedFrame, err := spoolBufferedFrame(frame, cleanMask, bufferDir, meta, now)
+			if err != nil {
+				closeBuffer(buffer)
+				return err
+			}
+			buffer = append(buffer, bufferedFrame)
 			buffer = trimBuffer(buffer, now.Add(-e.Config.Settings.PreEventDuration))
 
 			if interesting {
@@ -238,7 +252,11 @@ func (e *TrackerEngine) Run() error {
 			}
 		}
 
-		update := buildFrameUpdate(frame, cleanMask, tracks, meta, len(detections), recorder != nil, sourceFrame < int(fps*3), e.Config.ShowMask, e.Config.Settings)
+		totalFrames := 0
+		if e.Config.InputLabel == "video file" {
+			totalFrames = int(math.Round(capture.Get(gocv.VideoCaptureFrameCount)))
+		}
+		update := buildFrameUpdate(frame, cleanMask, tracks, meta, len(detections), recorder != nil, sourceFrame < int(fps*3), e.Config.ShowMask, e.Config.Settings, fps, totalFrames)
 		err = e.emitFrame(update, now)
 		update.Close()
 		if err != nil {
@@ -299,12 +317,21 @@ func (e *TrackerEngine) emitReady(capture *gocv.VideoCapture, fps float64) error
 	if e.Hooks.OnReady == nil {
 		return nil
 	}
+	totalFrames := int(math.Round(capture.Get(gocv.VideoCaptureFrameCount)))
+	hasFixedLength := e.Config.InputLabel == "video file" && totalFrames > 0
+	duration := time.Duration(0)
+	if hasFixedLength && fps > 0 {
+		duration = time.Duration(float64(time.Second) * (float64(totalFrames) / fps))
+	}
 	return e.Hooks.OnReady(TrackerReady{
-		Input:      e.Config.Input,
-		InputLabel: e.Config.InputLabel,
-		FPS:        fps,
-		Width:      int(capture.Get(gocv.VideoCaptureFrameWidth)),
-		Height:     int(capture.Get(gocv.VideoCaptureFrameHeight)),
+		Input:          e.Config.Input,
+		InputLabel:     e.Config.InputLabel,
+		FPS:            fps,
+		Width:          int(capture.Get(gocv.VideoCaptureFrameWidth)),
+		Height:         int(capture.Get(gocv.VideoCaptureFrameHeight)),
+		TotalFrames:    totalFrames,
+		Duration:       duration,
+		HasFixedLength: hasFixedLength,
 	})
 }
 
@@ -340,6 +367,8 @@ func buildFrameUpdate(
 	learningBackground bool,
 	includeMask bool,
 	settings TrackingSettings,
+	fps float64,
+	totalFrames int,
 ) FrameUpdate {
 	display := frame.Clone()
 	drawLiveOverlay(&display, tracks, settings)
@@ -363,6 +392,26 @@ func buildFrameUpdate(
 			gocv.FontHersheySimplex, 0.65, warnColor, 2)
 	}
 
+	elapsed := time.Duration(0)
+	if fps > 0 && meta.SourceFrame > 0 {
+		elapsed = time.Duration(float64(time.Second) * (float64(meta.SourceFrame) / fps))
+	}
+
+	totalDuration := time.Duration(0)
+	hasFixedLength := fps > 0 && totalFrames > 0
+	progress := 0.0
+	progressText := ""
+	if hasFixedLength {
+		totalDuration = time.Duration(float64(time.Second) * (float64(totalFrames) / fps))
+		progress = math.Min(1, float64(meta.SourceFrame)/float64(totalFrames))
+		progressText = fmt.Sprintf("Video: %s / %s (%.0f%%)",
+			formatVideoProgressDuration(elapsed),
+			formatVideoProgressDuration(totalDuration),
+			progress*100)
+		gocv.PutText(&display, progressText, image.Pt(20, 120),
+			gocv.FontHersheySimplex, 0.6, textColor, 2)
+	}
+
 	update := FrameUpdate{
 		SourceFrame:        meta.SourceFrame,
 		Metadata:           meta,
@@ -373,6 +422,11 @@ func buildFrameUpdate(
 		Recording:          recording,
 		LearningBackground: learningBackground,
 		StatusText:         status,
+		ProgressText:       progressText,
+		Elapsed:            elapsed,
+		TotalDuration:      totalDuration,
+		Progress:           progress,
+		HasFixedLength:     hasFixedLength,
 		Display:            display,
 		hasDisplay:         true,
 	}
@@ -383,4 +437,18 @@ func buildFrameUpdate(
 	}
 
 	return update
+}
+
+func formatVideoProgressDuration(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	totalSeconds := int(math.Round(d.Seconds()))
+	hours := totalSeconds / 3600
+	minutes := (totalSeconds % 3600) / 60
+	seconds := totalSeconds % 60
+	if hours > 0 {
+		return fmt.Sprintf("%02d:%02d:%02d", hours, minutes, seconds)
+	}
+	return fmt.Sprintf("%02d:%02d", minutes, seconds)
 }
