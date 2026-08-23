@@ -20,12 +20,12 @@ import (
 )
 
 const (
-	dwarfDefaultHost        = "192.168.88.1"
+	dwarfDefaultHost        = "192.168.50.136"
 	dwarfDefaultWSPort      = 9900
 	dwarfDefaultFTPPort     = 21
 	dwarfTelephotoCameraID  = 0
 	dwarfWideCameraID       = 1
-	dwarfDefaultFTPRoot     = "/"
+	dwarfDefaultFTPRoot     = "/Videos"
 	dwarfDefaultFTPUser     = "anonymous"
 	dwarfDefaultFTPPassword = "anonymous"
 )
@@ -999,6 +999,9 @@ func (c *dwarfFTPClient) login() error {
 
 func (c *dwarfFTPClient) walkVideoFiles(root string) ([]DwarfMediaFile, error) {
 	root = normalizeRemotePath(root)
+	if err := c.ensureRemoteDir(root); err != nil {
+		return nil, err
+	}
 	var files []DwarfMediaFile
 	queue := []string{root}
 	seen := map[string]struct{}{root: {}}
@@ -1082,6 +1085,34 @@ func (c *dwarfFTPClient) listDir(remoteDir string) ([]ftpListEntry, error) {
 		}
 	}
 	return entries, nil
+}
+
+func (c *dwarfFTPClient) ensureRemoteDir(remoteDir string) error {
+	remoteDir = normalizeRemotePath(remoteDir)
+	if remoteDir == dwarfDefaultFTPRoot {
+		return nil
+	}
+
+	parentDir := path.Dir(remoteDir)
+	if parentDir == "." {
+		parentDir = dwarfDefaultFTPRoot
+	}
+	base := path.Base(remoteDir)
+
+	entries, err := c.listDir(parentDir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.Name != base {
+			continue
+		}
+		if !entry.IsDir {
+			return fmt.Errorf("ftp path %s is not a directory", remoteDir)
+		}
+		return nil
+	}
+	return fmt.Errorf("ftp directory %s does not exist", remoteDir)
 }
 
 func (c *dwarfFTPClient) downloadFile(remotePath, localPath string) error {

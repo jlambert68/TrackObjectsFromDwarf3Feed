@@ -24,7 +24,7 @@ import (
 )
 
 const (
-	defaultHost           = "192.168.88.1"
+	defaultHost           = "192.168.50.136"
 	defaultWSPort         = 9900
 	defaultFTPPort        = 21
 	defaultFTPRoot        = "/"

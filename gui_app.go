@@ -128,6 +128,7 @@ type trackerApp struct {
 	dwarfCaptureStopCh   chan struct{}
 	dwarfQueuedFiles     []DwarfQueuedRecording
 	dwarfDownloadedFiles map[string]DwarfQueuedRecording
+	dwarfQueueProcessing bool
 	playbackActive       bool
 	playbackPaused       bool
 	playbackSeekFrame    int
@@ -190,6 +191,14 @@ type trackedObjectDetail struct {
 	LastPositionY  int
 }
 
+type dwarfDownloadRequest struct {
+	controller         DwarfController
+	camera             string
+	queueDir           string
+	recordingName      string
+	recordingStartedAt time.Time
+}
+
 type playbackOverlay struct {
 	Tracking           EventMetadata
 	Settings           TrackingSettings
@@ -227,6 +236,12 @@ const (
 	prefTrackingROIHeight   = "tracking.roi_height_fraction"
 	prefTrackingPresets     = "tracking.presets"
 	prefTrackingPresetName  = "tracking.preset_name"
+)
+
+const (
+	dwarfQueueStageQueue           = "queue"
+	dwarfQueueStageUnderProcessing = "UnderProcessing"
+	dwarfQueueStageProcessed       = "Processed"
 )
 
 func (e eventHistoryEntry) title() string {
@@ -851,6 +866,7 @@ func (ui *trackerApp) startDwarfCapture() {
 		ui.showError(err)
 		return
 	}
+	sessionDir := dwarfCaptureSessionDir(downloadDir, time.Now())
 
 	stopCh := make(chan struct{})
 
@@ -864,7 +880,7 @@ func (ui *trackerApp) startDwarfCapture() {
 	ui.fetchDwarfButton.Disable()
 	ui.dwarfStatusLabel.SetText("DWARF capture starting...")
 
-	go ui.runDwarfCapture(controller, camera, segmentDuration, downloadDir, stopCh)
+	go ui.runDwarfCapture(controller, camera, segmentDuration, sessionDir, stopCh)
 }
 
 func (ui *trackerApp) stopDwarfCapture() {
@@ -1043,10 +1059,36 @@ func (ui *trackerApp) runDwarfRawWSCommand(title string, payload string, allowTi
 	}()
 }
 
-func (ui *trackerApp) runDwarfCapture(controller DwarfController, camera string, segmentDuration time.Duration, downloadDir string, stopCh <-chan struct{}) {
+func (ui *trackerApp) runDwarfCapture(controller DwarfController, camera string, segmentDuration time.Duration, sessionDir string, stopCh <-chan struct{}) {
 	var runErr error
+	queueDir := dwarfQueueStageDir(sessionDir, dwarfQueueStageQueue)
+	downloadRequests := make(chan dwarfDownloadRequest, 8)
+	downloadErrCh := make(chan error, 1)
+	downloadDoneCh := make(chan struct{})
+
+	go ui.runDwarfDownloadWorker(downloadRequests, downloadErrCh, downloadDoneCh)
+	defer func() {
+		close(downloadRequests)
+		<-downloadDoneCh
+		select {
+		case err := <-downloadErrCh:
+			if err != nil && runErr == nil {
+				runErr = err
+			}
+		default:
+		}
+	}()
 
 	for {
+		select {
+		case err := <-downloadErrCh:
+			if err != nil {
+				runErr = err
+				goto finish
+			}
+		default:
+		}
+
 		recordingName := fmt.Sprintf("DWARF_%s", time.Now().Format("20060102150405"))
 		recordingStartedAt := time.Now()
 		if _, err := controller.StartVideoRecording(camera, recordingName); err != nil {
@@ -1060,9 +1102,16 @@ func (ui *trackerApp) runDwarfCapture(controller DwarfController, camera string,
 
 		timer := time.NewTimer(segmentDuration)
 		stopRequested := false
+		abortAfterStop := false
 		select {
 		case <-stopCh:
 			stopRequested = true
+		case err := <-downloadErrCh:
+			if err != nil {
+				runErr = err
+				stopRequested = true
+				abortAfterStop = true
+			}
 		case <-timer.C:
 		}
 		if !timer.Stop() {
@@ -1077,38 +1126,74 @@ func (ui *trackerApp) runDwarfCapture(controller DwarfController, camera string,
 			break
 		}
 
-		fyne.Do(func() {
-			ui.dwarfStatusLabel.SetText(fmt.Sprintf("DWARF %s finalizing: %s", strings.ToUpper(camera), recordingName))
-		})
-
-		time.Sleep(3 * time.Second)
-
-		recording, warningText, err := ui.downloadLatestDwarfVideo(controller, camera, downloadDir, recordingName, recordingStartedAt)
-		if err == nil {
+		request := dwarfDownloadRequest{
+			controller:         controller,
+			camera:             camera,
+			queueDir:           queueDir,
+			recordingName:      recordingName,
+			recordingStartedAt: recordingStartedAt,
+		}
+		select {
+		case downloadRequests <- request:
 			fyne.Do(func() {
-				ui.enqueueDwarfFile(recording)
-				if warningText != "" {
-					ui.dwarfStatusLabel.SetText(warningText)
-					return
-				}
-				ui.dwarfStatusLabel.SetText(fmt.Sprintf("DWARF queued: %s (%s)", filepath.Base(recording.LocalPath), strings.ToUpper(recording.Camera)))
+				ui.dwarfStatusLabel.SetText(fmt.Sprintf("DWARF %s stopped: %s   next segment can start while download runs", strings.ToUpper(camera), recordingName))
 			})
-		} else {
-			fyne.Do(func() {
-				ui.dwarfStatusLabel.SetText("DWARF download failed")
-			})
-			runErr = err
+		case err := <-downloadErrCh:
+			if err != nil {
+				fyne.Do(func() {
+					ui.dwarfStatusLabel.SetText("DWARF download failed")
+				})
+				runErr = err
+			}
+		}
+		if runErr != nil {
 			break
 		}
 
-		if stopRequested {
+		if stopRequested || abortAfterStop {
 			break
 		}
 	}
 
+finish:
 	fyne.Do(func() {
 		ui.finishDwarfCapture(runErr)
 	})
+}
+
+func (ui *trackerApp) runDwarfDownloadWorker(requests <-chan dwarfDownloadRequest, errCh chan<- error, done chan<- struct{}) {
+	defer close(done)
+
+	for request := range requests {
+		time.Sleep(3 * time.Second)
+
+		recording, warningText, err := ui.downloadLatestDwarfVideo(
+			request.controller,
+			request.camera,
+			request.queueDir,
+			request.recordingName,
+			request.recordingStartedAt,
+		)
+		if err != nil {
+			fyne.Do(func() {
+				ui.dwarfStatusLabel.SetText("DWARF download failed")
+			})
+			select {
+			case errCh <- err:
+			default:
+			}
+			return
+		}
+
+		fyne.Do(func() {
+			ui.enqueueDwarfFile(recording)
+			if warningText != "" {
+				ui.dwarfStatusLabel.SetText(warningText)
+				return
+			}
+			ui.dwarfStatusLabel.SetText(fmt.Sprintf("DWARF queued: %s (%s)", filepath.Base(recording.LocalPath), strings.ToUpper(recording.Camera)))
+		})
+	}
 }
 
 func (ui *trackerApp) finishDwarfCapture(err error) {
@@ -1150,7 +1235,7 @@ func (ui *trackerApp) downloadLatestDwarfVideo(controller DwarfController, camer
 		return DwarfQueuedRecording{}, "", errors.New("no new DWARF video file available for download")
 	}
 
-	localPath := filepath.Join(downloadDir, filepath.Base(selected.Path))
+	localPath := dwarfDownloadLocalPath(downloadDir, recordingName, selected.Path)
 	if err := controller.DownloadFile(selected.Path, localPath); err != nil {
 		return DwarfQueuedRecording{}, "", err
 	}
@@ -1181,6 +1266,24 @@ func (ui *trackerApp) downloadLatestDwarfVideo(controller DwarfController, camer
 	}
 
 	return recording, "", nil
+}
+
+func dwarfDownloadLocalPath(downloadDir string, recordingName string, remotePath string) string {
+	if filepath.Base(filepath.Clean(downloadDir)) == dwarfQueueStageQueue {
+		return filepath.Join(downloadDir, filepath.Base(remotePath))
+	}
+	if strings.TrimSpace(recordingName) == "" {
+		return filepath.Join(downloadDir, filepath.Base(remotePath))
+	}
+	return filepath.Join(downloadDir, recordingName, filepath.Base(remotePath))
+}
+
+func dwarfCaptureSessionDir(downloadDir string, startedAt time.Time) string {
+	return filepath.Join(downloadDir, startedAt.Format("2006-01-02_150405"))
+}
+
+func dwarfQueueStageDir(sessionDir string, stage string) string {
+	return filepath.Join(sessionDir, stage)
 }
 
 func findDwarfMediaFileForDownload(controller DwarfController, downloaded map[string]DwarfQueuedRecording, camera string, recordingName string, recordingStartedAt time.Time) (*DwarfMediaFile, error) {
@@ -1391,6 +1494,131 @@ func (ui *trackerApp) enqueueDwarfFile(recording DwarfQueuedRecording) {
 	ui.mu.Unlock()
 
 	ui.dwarfQueueLabel.SetText(fmt.Sprintf("DWARF queue: %d   latest: %s (%s)", queueCount, filepath.Base(recording.LocalPath), strings.ToUpper(recording.Camera)))
+	ui.maybeStartDwarfQueueProcessor()
+}
+
+func (ui *trackerApp) maybeStartDwarfQueueProcessor() {
+	ui.mu.Lock()
+	if ui.dwarfQueueProcessing || ui.running || len(ui.dwarfQueuedFiles) == 0 {
+		ui.mu.Unlock()
+		return
+	}
+	stopCh := make(chan struct{})
+	ui.dwarfQueueProcessing = true
+	ui.running = true
+	ui.stopCh = stopCh
+	ui.mu.Unlock()
+
+	ui.startButton.Disable()
+	ui.stopButton.Enable()
+	ui.statusLabel.SetText("Processing DWARF queue...")
+	go ui.runDwarfQueueProcessor(stopCh)
+}
+
+func (ui *trackerApp) runDwarfQueueProcessor(stopCh chan struct{}) {
+	err := ui.processDwarfQueue(stopCh)
+	fyne.Do(func() {
+		ui.finishDwarfQueueProcessing(err)
+	})
+}
+
+func (ui *trackerApp) processDwarfQueue(stopCh <-chan struct{}) error {
+	for {
+		select {
+		case <-stopCh:
+			return ErrStopTracking
+		default:
+		}
+
+		ui.mu.Lock()
+		if len(ui.dwarfQueuedFiles) == 0 {
+			ui.mu.Unlock()
+			return nil
+		}
+		recording := ui.dwarfQueuedFiles[0]
+		ui.dwarfQueuedFiles = ui.dwarfQueuedFiles[1:]
+		remaining := len(ui.dwarfQueuedFiles)
+		ui.mu.Unlock()
+
+		fyne.Do(func() {
+			ui.dwarfQueueLabel.SetText(fmt.Sprintf("DWARF queue: %d   processing: %s (%s)", remaining, filepath.Base(recording.LocalPath), strings.ToUpper(recording.Camera)))
+			ui.statusLabel.SetText("Processing queued DWARF video...")
+		})
+
+		processingRecording, err := moveDwarfQueuedRecordingToStage(recording, dwarfQueueStageUnderProcessing)
+		if err != nil {
+			return err
+		}
+		ui.updateDownloadedDwarfRecording(processingRecording)
+
+		config, err := ui.buildQueuedDwarfTrackerConfig(processingRecording.LocalPath)
+		if err != nil {
+			return err
+		}
+		if err := ui.executeTracker(config, stopCh); err != nil {
+			return err
+		}
+
+		processedRecording, err := moveDwarfQueuedRecordingToStage(processingRecording, dwarfQueueStageProcessed)
+		if err != nil {
+			return err
+		}
+		ui.updateDownloadedDwarfRecording(processedRecording)
+
+		fyne.Do(func() {
+			ui.dwarfStatusLabel.SetText(fmt.Sprintf("DWARF processed: %s (%s)", filepath.Base(processedRecording.LocalPath), strings.ToUpper(processedRecording.Camera)))
+			ui.refreshEventHistory()
+		})
+	}
+}
+
+func (ui *trackerApp) finishDwarfQueueProcessing(err error) {
+	ui.mu.Lock()
+	ui.dwarfQueueProcessing = false
+	ui.running = false
+	ui.stopCh = nil
+	pending := len(ui.dwarfQueuedFiles)
+	ui.mu.Unlock()
+
+	ui.startButton.Enable()
+	ui.stopButton.Disable()
+	if pending > 0 {
+		ui.dwarfQueueLabel.SetText(fmt.Sprintf("DWARF queue: %d", pending))
+	} else {
+		ui.dwarfQueueLabel.SetText("DWARF queue: 0")
+	}
+
+	switch {
+	case err == nil || errors.Is(err, ErrStopTracking):
+		ui.statusLabel.SetText("Idle")
+	default:
+		ui.statusLabel.SetText("Stopped with error")
+		ui.showError(err)
+	}
+}
+
+func (ui *trackerApp) updateDownloadedDwarfRecording(recording DwarfQueuedRecording) {
+	ui.mu.Lock()
+	ui.dwarfDownloadedFiles[recording.RemotePath] = recording
+	ui.mu.Unlock()
+}
+
+func moveDwarfQueuedRecordingToStage(recording DwarfQueuedRecording, stage string) (DwarfQueuedRecording, error) {
+	stageDir := dwarfQueueStageDir(dwarfQueuedRecordingSessionDir(recording.LocalPath), stage)
+	if err := os.MkdirAll(stageDir, 0o755); err != nil {
+		return DwarfQueuedRecording{}, fmt.Errorf("create dwarf %s directory: %w", stage, err)
+	}
+
+	nextPath := filepath.Join(stageDir, filepath.Base(recording.LocalPath))
+	if err := os.Rename(recording.LocalPath, nextPath); err != nil {
+		return DwarfQueuedRecording{}, fmt.Errorf("move dwarf recording to %s: %w", stage, err)
+	}
+	recording.LocalPath = nextPath
+	return recording, nil
+}
+
+func dwarfQueuedRecordingSessionDir(localPath string) string {
+	return filepath.Dir(filepath.Dir(localPath))
 }
 
 func (ui *trackerApp) startTracking() {
@@ -1648,6 +1876,28 @@ func (ui *trackerApp) buildConfig() (TrackerConfig, error) {
 	}, nil
 }
 
+func (ui *trackerApp) buildQueuedDwarfTrackerConfig(videoPath string) (TrackerConfig, error) {
+	settings, err := ui.buildTrackingSettings()
+	if err != nil {
+		return TrackerConfig{}, err
+	}
+
+	outputDir := ui.outputEntry.Text
+	if outputDir == "" {
+		outputDir = "events"
+	}
+
+	return TrackerConfig{
+		Input:        videoPath,
+		InputLabel:   "video file",
+		OutputDir:    outputDir,
+		ShowMask:     ui.showMask.Checked,
+		RecordEvents: true,
+		FallbackFPS:  ui.parseFallbackFPS(),
+		Settings:     settings,
+	}, nil
+}
+
 func (ui *trackerApp) parseFallbackFPS() float64 {
 	fallbackFPS, err := strconv.ParseFloat(ui.fpsEntry.Text, 64)
 	if err != nil || fallbackFPS <= 0 {
@@ -1657,6 +1907,13 @@ func (ui *trackerApp) parseFallbackFPS() float64 {
 }
 
 func (ui *trackerApp) runTracker(config TrackerConfig, stopCh chan struct{}) {
+	err := ui.executeTracker(config, stopCh)
+	fyne.Do(func() {
+		ui.finishRun(err, "Idle")
+	})
+}
+
+func (ui *trackerApp) executeTracker(config TrackerConfig, stopCh <-chan struct{}) error {
 	engine := TrackerEngine{
 		Config: config,
 		Stop:   stopCh,
@@ -1740,10 +1997,7 @@ func (ui *trackerApp) runTracker(config TrackerConfig, stopCh chan struct{}) {
 			})
 		}
 	}
-
-	fyne.Do(func() {
-		ui.finishRun(err, "Idle")
-	})
+	return err
 }
 
 func (ui *trackerApp) runPlayback(path, label, maskPath string, stopCh chan struct{}, overlay *playbackOverlay) {
@@ -1992,6 +2246,8 @@ func (ui *trackerApp) finishRun(err error, idleText string) {
 		ui.statusLabel.SetText("Stopped with error")
 		ui.showError(err)
 	}
+
+	ui.maybeStartDwarfQueueProcessor()
 }
 
 func (ui *trackerApp) refreshEventHistory() {

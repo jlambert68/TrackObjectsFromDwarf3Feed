@@ -79,6 +79,7 @@ type DwarfProtoTransport struct {
 	pingDone chan struct{}
 	state    DwarfProtoSessionState
 	nextID   uint32
+	pending  []dwarfProtoPacket
 }
 
 type DwarfProtoCommandResult struct {
@@ -243,7 +244,7 @@ func (t *DwarfProtoTransport) SendBinaryCommand(command DwarfProtoCommand, allow
 			if isPrintableDeviceText(response) {
 				text := strings.TrimSpace(string(response))
 				t.log("PROTO RECV TEXT %s id=%d text=%q", t.url, command.RequestID, text)
-				return nil, fmt.Errorf("device returned text response: %s", text)
+				continue
 			}
 			t.log("PROTO RECV DECODE ERROR %s id=%d err=%v hex=%s", t.url, command.RequestID, err, hex.EncodeToString(response))
 			return nil, fmt.Errorf("decode protobuf websocket response: %w", err)
@@ -253,6 +254,7 @@ func (t *DwarfProtoTransport) SendBinaryCommand(command DwarfProtoCommand, allow
 
 		if !isMatchingProtoReply(command, packet) {
 			t.log("PROTO SKIP %s id=%d expectedCmd=%d gotCmd=%d gotType=%d", t.url, command.RequestID, command.Cmd, packet.Cmd, packet.Type)
+			t.stashPacket(packet)
 			continue
 		}
 
@@ -286,6 +288,15 @@ func (t *DwarfProtoTransport) WaitForPacket(match func(dwarfProtoPacket) bool, t
 		return nil, fmt.Errorf("set protobuf websocket deadline: %w", err)
 	}
 
+	if packet, ok := t.takePendingPacket(match); ok {
+		t.log("PROTO WAIT PENDING %s cmd=%d type=%d client=%q dataHex=%s", t.url, packet.Cmd, packet.Type, packet.ClientID, hex.EncodeToString(packet.Data))
+		return &DwarfProtoPacketWaitResult{
+			Packet:      packet,
+			ReceivedAt:  time.Now(),
+			ResponseHex: hex.EncodeToString(packet.Data),
+		}, nil
+	}
+
 	for {
 		var response []byte
 		if err := websocket.Message.Receive(conn, &response); err != nil {
@@ -315,6 +326,25 @@ func (t *DwarfProtoTransport) WaitForPacket(match func(dwarfProtoPacket) bool, t
 			ResponseHex: hex.EncodeToString(packet.Data),
 		}, nil
 	}
+}
+
+func (t *DwarfProtoTransport) stashPacket(packet dwarfProtoPacket) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.pending = append(t.pending, packet)
+}
+
+func (t *DwarfProtoTransport) takePendingPacket(match func(dwarfProtoPacket) bool) (dwarfProtoPacket, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for i, packet := range t.pending {
+		if !match(packet) {
+			continue
+		}
+		t.pending = append(t.pending[:i], t.pending[i+1:]...)
+		return packet, true
+	}
+	return dwarfProtoPacket{}, false
 }
 
 func (t *DwarfProtoTransport) runPingLoop() {

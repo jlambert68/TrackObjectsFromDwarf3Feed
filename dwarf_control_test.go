@@ -57,8 +57,15 @@ func TestNormalizeRemotePath(t *testing.T) {
 	if got := normalizeRemotePath(" album/2026/../latest "); got != "/album/latest" {
 		t.Fatalf("unexpected normalized path: %s", got)
 	}
-	if got := normalizeRemotePath(""); got != "/" {
-		t.Fatalf("unexpected root path: %s", got)
+	if got := normalizeRemotePath(""); got != "/Videos" {
+		t.Fatalf("unexpected normalized root path: %s", got)
+	}
+}
+
+func TestDefaultDwarfControllerUsesVideosRoot(t *testing.T) {
+	controller := DefaultDwarfController()
+	if controller.FTPRoot != "/Videos" {
+		t.Fatalf("unexpected default dwarf ftp root: %s", controller.FTPRoot)
 	}
 }
 
