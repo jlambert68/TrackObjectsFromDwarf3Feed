@@ -8,7 +8,12 @@ import (
 	"gocv.io/x/gocv"
 )
 
-const maxMissedFrames = 2
+func maxMissedFramesForSettings(settings TrackingSettings) int {
+	if settings.Profile == trackingProfileBall {
+		return 12
+	}
+	return 2
+}
 
 // findDetections converts the cleaned foreground mask into bounding boxes and
 // centers that can be handed to the tracker.
@@ -166,6 +171,9 @@ func updateTracks(
 			if dt <= 0 || dt > 1 {
 				dt = frameDT
 			}
+			if settings.Profile == trackingProfileBall {
+				dt = frameDT
+			}
 
 			predictedX := float64(track.Position.X) + track.VX*dt
 			predictedY := float64(track.Position.Y) + track.VY*dt
@@ -229,12 +237,16 @@ func updateTracks(
 	for i, track := range tracks {
 		if !trackMatched[i] {
 			track.Missed++
+			if settings.Profile == trackingProfileBall {
+				track.VX *= 0.35
+				track.VY *= 0.35
+			}
 		}
 	}
 
 	activeTracks := tracks[:0]
 	for _, track := range tracks {
-		if track.Missed > maxMissedFrames {
+		if track.Missed > maxMissedFramesForSettings(settings) {
 			continue
 		}
 		activeTracks = append(activeTracks, track)
@@ -291,6 +303,13 @@ func scoreTrackDetectionMatch(track *Track, detection Detection, predictedX, pre
 	distanceScore := distance / settings.MaxMatchDistance
 	sizePenalty := math.Max(0, areaRatio-1.0) * 0.20
 	overlapBonus := iou * 0.85
+	if settings.Profile == trackingProfileBall {
+		if track.Hits >= settings.MinHits && areaRatio > 2.2 && iou < 0.12 {
+			return 0, false
+		}
+		sizePenalty = math.Max(0, areaRatio-1.0) * 0.30
+		overlapBonus = iou * 1.15
+	}
 
 	return distanceScore + sizePenalty - overlapBonus, true
 }

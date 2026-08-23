@@ -15,12 +15,13 @@ var ErrStopTracking = errors.New("stop tracking")
 
 // TrackerConfig defines one tracker run independently of any specific UI.
 type TrackerConfig struct {
-	Input       string
-	InputLabel  string
-	OutputDir   string
-	ShowMask    bool
-	FallbackFPS float64
-	Settings    TrackingSettings
+	Input        string
+	InputLabel   string
+	OutputDir    string
+	ShowMask     bool
+	RecordEvents bool
+	FallbackFPS  float64
+	Settings     TrackingSettings
 }
 
 // TrackerReady reports source properties once the input stream has opened.
@@ -90,6 +91,8 @@ type TrackerEngine struct {
 	Config TrackerConfig
 	Hooks  TrackerHooks
 	Stop   <-chan struct{}
+
+	RawSegmentDir string
 }
 
 func (e *TrackerEngine) effectiveSettings() TrackingSettings {
@@ -99,6 +102,10 @@ func (e *TrackerEngine) effectiveSettings() TrackingSettings {
 		settings.PostEventDuration = 3 * time.Second
 	}
 	return settings
+}
+
+func (e *TrackerEngine) shouldRecordEvents() bool {
+	return e.Config.RecordEvents
 }
 
 // Run executes the tracker until the input ends, the caller asks it to stop,
@@ -147,11 +154,17 @@ func (e *TrackerEngine) Run() error {
 	var tracks []*Track
 	var buffer []BufferedFrame
 	var recorder *EventRecorder
+	var segmentRecorder *RawSegmentRecorder
 	bufferDir, err := os.MkdirTemp("", "trackobject-buffer-*")
 	if err != nil {
 		return fmt.Errorf("create frame spool directory: %w", err)
 	}
 	defer os.RemoveAll(bufferDir)
+	defer func() {
+		if segmentRecorder != nil {
+			_ = segmentRecorder.Close()
+		}
+	}()
 
 	nextTrackID := 1
 	sourceFrame := 0
@@ -184,6 +197,20 @@ func (e *TrackerEngine) Run() error {
 
 		sourceFrame++
 
+		if e.shouldRecordEvents() && segmentRecorder == nil && settings.RawSegmentDuration > 0 {
+			segmentRecorder, err = startRawSegmentRecorder(e.Config.OutputDir, fps, frame.Cols(), frame.Rows(), settings)
+			if err != nil {
+				return err
+			}
+			e.RawSegmentDir = segmentRecorder.Directory
+		}
+		if segmentRecorder != nil {
+			timeOffset := time.Duration(float64(sourceFrame-1) * float64(time.Second) / fps)
+			if err := segmentRecorder.RecordFrame(frame, sourceFrame, timeOffset); err != nil {
+				return err
+			}
+		}
+
 		if err := gocv.CvtColor(frame, &gray, gocv.ColorBGRToGray); err != nil {
 			continue
 		}
@@ -215,7 +242,10 @@ func (e *TrackerEngine) Run() error {
 			lastInteresting = now
 		}
 
-		if recorder == nil {
+		if !e.shouldRecordEvents() {
+			// Full-segment processing mode still emits per-frame metadata through
+			// OnFrame, but it does not open per-event video writers.
+		} else if recorder == nil {
 			bufferedFrame, err := spoolBufferedFrame(frame, cleanMask, bufferDir, meta, now)
 			if err != nil {
 				closeBuffer(buffer)

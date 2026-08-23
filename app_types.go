@@ -10,12 +10,15 @@ import (
 )
 
 const (
-	trackBoxScale     = 4
-	trackCircleRadius = 16
-	trackCrosshairArm = 24
+	trackBoxScale          = 4
+	trackCircleRadius      = 16
+	trackCrosshairArm      = 24
+	trackingProfileGeneral = "general"
+	trackingProfileBall    = "rolling_ball"
 )
 
 type TrackingSettings struct {
+	Profile               string
 	MinArea               float64
 	MaxArea               float64
 	SlowMinSpeed          float64
@@ -26,31 +29,97 @@ type TrackingSettings struct {
 	ForegroundThreshold   float64
 	PreEventDuration      time.Duration
 	PostEventDuration     time.Duration
+	RawSegmentDuration    time.Duration
+	RawSegmentOverlap     time.Duration
 	MOG2History           int
 	MOG2VarThreshold      float64
 	TrackingROIHeightFrac float64
 }
 
 func DefaultTrackingSettings() TrackingSettings {
-	return TrackingSettings{
-		MinArea:               6.0,
-		MaxArea:               15000.0,
-		SlowMinSpeed:          10.0,
-		MinSpeed:              40.0,
-		MaxMatchDistance:      100.0,
-		MinHits:               2,
-		BlurSize:              5,
-		ForegroundThreshold:   200.0,
-		PreEventDuration:      5 * time.Second,
-		PostEventDuration:     5 * time.Second,
-		MOG2History:           500,
-		MOG2VarThreshold:      16.0,
-		TrackingROIHeightFrac: 0.90,
+	return DefaultTrackingSettingsForProfile(trackingProfileGeneral)
+}
+
+func DefaultTrackingSettingsForProfile(profile string) TrackingSettings {
+	switch profile {
+	case trackingProfileBall:
+		return TrackingSettings{
+			Profile:               trackingProfileBall,
+			MinArea:               20.0,
+			MaxArea:               15000.0,
+			SlowMinSpeed:          1.5,
+			MinSpeed:              4.0,
+			MaxMatchDistance:      140.0,
+			MinHits:               2,
+			BlurSize:              3,
+			ForegroundThreshold:   160.0,
+			PreEventDuration:      5 * time.Second,
+			PostEventDuration:     5 * time.Second,
+			RawSegmentDuration:    0,
+			RawSegmentOverlap:     1 * time.Second,
+			MOG2History:           300,
+			MOG2VarThreshold:      12.0,
+			TrackingROIHeightFrac: 0.90,
+		}
+	default:
+		return TrackingSettings{
+			Profile:               trackingProfileGeneral,
+			MinArea:               6.0,
+			MaxArea:               15000.0,
+			SlowMinSpeed:          10.0,
+			MinSpeed:              40.0,
+			MaxMatchDistance:      100.0,
+			MinHits:               2,
+			BlurSize:              5,
+			ForegroundThreshold:   200.0,
+			PreEventDuration:      5 * time.Second,
+			PostEventDuration:     5 * time.Second,
+			RawSegmentDuration:    0,
+			RawSegmentOverlap:     1 * time.Second,
+			MOG2History:           500,
+			MOG2VarThreshold:      16.0,
+			TrackingROIHeightFrac: 0.90,
+		}
+	}
+}
+
+func normalizeTrackingProfile(profile string) string {
+	switch profile {
+	case trackingProfileBall:
+		return trackingProfileBall
+	default:
+		return trackingProfileGeneral
+	}
+}
+
+func trackingProfileLabel(profile string) string {
+	switch normalizeTrackingProfile(profile) {
+	case trackingProfileBall:
+		return "Rolling Ball"
+	default:
+		return "General"
+	}
+}
+
+func trackingProfileFromLabel(label string) string {
+	switch label {
+	case "Rolling Ball":
+		return trackingProfileBall
+	default:
+		return trackingProfileGeneral
+	}
+}
+
+func trackingProfileOptions() []string {
+	return []string{
+		trackingProfileLabel(trackingProfileGeneral),
+		trackingProfileLabel(trackingProfileBall),
 	}
 }
 
 func NormalizeTrackingSettings(settings TrackingSettings) TrackingSettings {
-	defaults := DefaultTrackingSettings()
+	settings.Profile = normalizeTrackingProfile(settings.Profile)
+	defaults := DefaultTrackingSettingsForProfile(settings.Profile)
 
 	if settings.MinArea <= 0 {
 		settings.MinArea = defaults.MinArea
@@ -81,6 +150,18 @@ func NormalizeTrackingSettings(settings TrackingSettings) TrackingSettings {
 	}
 	if settings.PostEventDuration <= 0 {
 		settings.PostEventDuration = defaults.PostEventDuration
+	}
+	if settings.RawSegmentDuration < 0 {
+		settings.RawSegmentDuration = defaults.RawSegmentDuration
+	}
+	if settings.RawSegmentOverlap < 0 {
+		settings.RawSegmentOverlap = defaults.RawSegmentOverlap
+	}
+	if settings.RawSegmentDuration > 0 && settings.RawSegmentOverlap >= settings.RawSegmentDuration {
+		settings.RawSegmentOverlap = defaults.RawSegmentOverlap
+		if settings.RawSegmentOverlap >= settings.RawSegmentDuration {
+			settings.RawSegmentOverlap = settings.RawSegmentDuration / 2
+		}
 	}
 	if settings.MOG2History < 1 {
 		settings.MOG2History = defaults.MOG2History
@@ -202,6 +283,40 @@ type EventMetadata struct {
 	Width     int             `json:"width"`
 	Height    int             `json:"height"`
 	Frames    []FrameMetadata `json:"frames"`
+}
+
+type RawVideoSegment struct {
+	Index               int    `json:"index"`
+	File                string `json:"file"`
+	StartFrame          int    `json:"start_frame"`
+	EndFrame            int    `json:"end_frame"`
+	StartTimeMS         int64  `json:"start_time_ms"`
+	EndTimeMS           int64  `json:"end_time_ms"`
+	Frames              int    `json:"frames"`
+	OverlapBeforeFrames int    `json:"overlap_before_frames"`
+	OverlapAfterFrames  int    `json:"overlap_after_frames"`
+}
+
+type RawSegmentManifest struct {
+	SessionID       string            `json:"session_id"`
+	CreatedAt       time.Time         `json:"created_at"`
+	FPS             float64           `json:"fps"`
+	Width           int               `json:"width"`
+	Height          int               `json:"height"`
+	SegmentDuration time.Duration     `json:"segment_duration"`
+	SegmentOverlap  time.Duration     `json:"segment_overlap"`
+	Segments        []RawVideoSegment `json:"segments"`
+}
+
+type DwarfQueuedRecording struct {
+	Camera          string    `json:"camera"`
+	RemotePath      string    `json:"remote_path"`
+	RemoteName      string    `json:"remote_name"`
+	LocalPath       string    `json:"local_path"`
+	RecordingName   string    `json:"recording_name,omitempty"`
+	RecordingStart  time.Time `json:"recording_start,omitempty"`
+	DownloadedAt    time.Time `json:"downloaded_at"`
+	DeleteRequested bool      `json:"delete_requested"`
 }
 
 // BufferedFrame is one pre-event frame kept in RAM so recording can include

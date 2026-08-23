@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,12 +35,19 @@ type trackerApp struct {
 	fileEntry                *widget.Entry
 	outputEntry              *widget.Entry
 	fpsEntry                 *widget.Entry
+	dwarfHostEntry           *widget.Entry
+	dwarfCameraSelect        *widget.Select
+	dwarfSegmentEntry        *widget.Entry
+	dwarfDownloadDirEntry    *widget.Entry
+	dwarfDeleteCheck         *widget.Check
+	dwarfDebugWSCheck        *widget.Check
 	showMask                 *widget.Check
 	dateFilter               *widget.Entry
 	objectFilter             *widget.Entry
 	speedFilter              *widget.Entry
 	sortSelect               *widget.Select
 	presetSelect             *widget.Select
+	profileSelect            *widget.Select
 	presetNameEntry          *widget.Entry
 	minAreaEntry             *widget.Entry
 	maxAreaEntry             *widget.Entry
@@ -51,14 +59,24 @@ type trackerApp struct {
 	foregroundThresholdEntry *widget.Entry
 	preEventEntry            *widget.Entry
 	postEventEntry           *widget.Entry
+	rawSegmentEntry          *widget.Entry
+	rawSegmentOverlapEntry   *widget.Entry
 	mog2HistoryEntry         *widget.Entry
 	mog2VarThresholdEntry    *widget.Entry
 	roiHeightEntry           *widget.Entry
 
 	fileButton            *widget.Button
 	outputButton          *widget.Button
+	dwarfDownloadButton   *widget.Button
 	startButton           *widget.Button
 	stopButton            *widget.Button
+	startDwarfButton      *widget.Button
+	stopDwarfButton       *widget.Button
+	fetchDwarfButton      *widget.Button
+	testDwarfButton       *widget.Button
+	testDwarfRecordButton *widget.Button
+	rawDwarfWSButton      *widget.Button
+	sessionProbeButton    *widget.Button
 	resetTrackingButton   *widget.Button
 	importTrackingButton  *widget.Button
 	exportTrackingButton  *widget.Button
@@ -82,6 +100,8 @@ type trackerApp struct {
 
 	statusLabel        *widget.Label
 	eventLabel         *widget.Label
+	dwarfStatusLabel   *widget.Label
+	dwarfQueueLabel    *widget.Label
 	playbackLabel      *widget.Label
 	historyList        *widget.List
 	historyInfo        *widget.Label
@@ -90,6 +110,9 @@ type trackerApp struct {
 	objectName         *widget.Entry
 	objectDetail       *widget.Entry
 	objectMapSkipEntry *widget.Entry
+
+	dwarfRawWSPayload        string
+	dwarfSessionProbePayload string
 
 	allHistoryEntries []eventHistoryEntry
 	historyEntries    []eventHistoryEntry
@@ -101,6 +124,10 @@ type trackerApp struct {
 	mu                   sync.Mutex
 	running              bool
 	stopCh               chan struct{}
+	dwarfCaptureRunning  bool
+	dwarfCaptureStopCh   chan struct{}
+	dwarfQueuedFiles     []DwarfQueuedRecording
+	dwarfDownloadedFiles map[string]DwarfQueuedRecording
 	playbackActive       bool
 	playbackPaused       bool
 	playbackSeekFrame    int
@@ -108,6 +135,19 @@ type trackerApp struct {
 	playbackTotalFrames  int
 	playbackFPS          float64
 	updatingPlaybackUI   bool
+}
+
+func (ui *trackerApp) showError(err error) {
+	if err == nil {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+	dialog.ShowError(err, ui.window)
+}
+
+func (ui *trackerApp) showInfo(title, message string) {
+	fmt.Fprintf(os.Stdout, "INFO [%s]: %s\n", title, message)
+	dialog.ShowInformation(title, message, ui.window)
 }
 
 type eventHistoryEntry struct {
@@ -180,6 +220,8 @@ const (
 	prefTrackingThreshold   = "tracking.foreground_threshold"
 	prefTrackingPreEvent    = "tracking.pre_event_seconds"
 	prefTrackingPostEvent   = "tracking.post_event_seconds"
+	prefTrackingRawSegment  = "tracking.raw_segment_seconds"
+	prefTrackingRawOverlap  = "tracking.raw_segment_overlap_seconds"
 	prefTrackingMOG2History = "tracking.mog2_history"
 	prefTrackingMOG2Var     = "tracking.mog2_var_threshold"
 	prefTrackingROIHeight   = "tracking.roi_height_fraction"
@@ -223,6 +265,7 @@ func main() {
 	window.SetContent(ui.buildUI())
 	window.SetCloseIntercept(func() {
 		ui.stopTracking()
+		ui.stopDwarfCapture()
 		window.Close()
 	})
 
@@ -246,6 +289,23 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 	fpsEntry := widget.NewEntry()
 	fpsEntry.SetText("30")
 
+	dwarfHostEntry := widget.NewEntry()
+	dwarfHostEntry.SetText(dwarfDefaultHost)
+
+	dwarfCameraSelect := widget.NewSelect([]string{"Tele", "Wide"}, nil)
+	dwarfCameraSelect.SetSelected("Tele")
+
+	dwarfSegmentEntry := widget.NewEntry()
+	dwarfSegmentEntry.SetText("60")
+
+	dwarfDownloadDirEntry := widget.NewEntry()
+	dwarfDownloadDirEntry.SetText("dwarf_downloads")
+
+	dwarfDeleteCheck := widget.NewCheck("Delete remote after download", nil)
+	dwarfDeleteCheck.SetChecked(false)
+	dwarfDebugWSCheck := widget.NewCheck("Log DWARF websocket JSON", nil)
+	dwarfDebugWSCheck.SetChecked(false)
+
 	showMask := widget.NewCheck("Show mask tab", nil)
 	showMask.SetChecked(true)
 
@@ -268,6 +328,10 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 	presetSelect := widget.NewSelect(nil, nil)
 	presetNameEntry := widget.NewEntry()
 	presetNameEntry.SetPlaceHolder("Preset name")
+
+	defaults := DefaultTrackingSettings()
+	profileSelect := widget.NewSelect(trackingProfileOptions(), nil)
+	profileSelect.SetSelected(trackingProfileLabel(defaults.Profile))
 
 	videoImage := canvas.NewImageFromImage(newPlaceholderFrame())
 	videoImage.FillMode = canvas.ImageFillContain
@@ -317,7 +381,6 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 	objectMapSkipEntry := widget.NewEntry()
 	objectMapSkipEntry.SetText("0")
 
-	defaults := DefaultTrackingSettings()
 	minAreaEntry := widget.NewEntry()
 	minAreaEntry.SetText(formatFloat(defaults.MinArea))
 	maxAreaEntry := widget.NewEntry()
@@ -338,6 +401,10 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 	preEventEntry.SetText(formatFloat(defaults.PreEventDuration.Seconds()))
 	postEventEntry := widget.NewEntry()
 	postEventEntry.SetText(formatFloat(defaults.PostEventDuration.Seconds()))
+	rawSegmentEntry := widget.NewEntry()
+	rawSegmentEntry.SetText(formatFloat(defaults.RawSegmentDuration.Seconds()))
+	rawSegmentOverlapEntry := widget.NewEntry()
+	rawSegmentOverlapEntry.SetText(formatFloat(defaults.RawSegmentOverlap.Seconds()))
 	mog2HistoryEntry := widget.NewEntry()
 	mog2HistoryEntry.SetText(strconv.Itoa(defaults.MOG2History))
 	mog2VarThresholdEntry := widget.NewEntry()
@@ -352,12 +419,19 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 		fileEntry:                fileEntry,
 		outputEntry:              outputEntry,
 		fpsEntry:                 fpsEntry,
+		dwarfHostEntry:           dwarfHostEntry,
+		dwarfCameraSelect:        dwarfCameraSelect,
+		dwarfSegmentEntry:        dwarfSegmentEntry,
+		dwarfDownloadDirEntry:    dwarfDownloadDirEntry,
+		dwarfDeleteCheck:         dwarfDeleteCheck,
+		dwarfDebugWSCheck:        dwarfDebugWSCheck,
 		showMask:                 showMask,
 		dateFilter:               dateFilter,
 		objectFilter:             objectFilter,
 		speedFilter:              speedFilter,
 		sortSelect:               sortSelect,
 		presetSelect:             presetSelect,
+		profileSelect:            profileSelect,
 		presetNameEntry:          presetNameEntry,
 		minAreaEntry:             minAreaEntry,
 		maxAreaEntry:             maxAreaEntry,
@@ -369,6 +443,8 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 		foregroundThresholdEntry: foregroundThresholdEntry,
 		preEventEntry:            preEventEntry,
 		postEventEntry:           postEventEntry,
+		rawSegmentEntry:          rawSegmentEntry,
+		rawSegmentOverlapEntry:   rawSegmentOverlapEntry,
 		mog2HistoryEntry:         mog2HistoryEntry,
 		mog2VarThresholdEntry:    mog2VarThresholdEntry,
 		roiHeightEntry:           roiHeightEntry,
@@ -379,6 +455,8 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 		playbackSlider:           playbackSlider,
 		statusLabel:              widget.NewLabel("Idle"),
 		eventLabel:               widget.NewLabel("No event yet"),
+		dwarfStatusLabel:         widget.NewLabel("DWARF idle"),
+		dwarfQueueLabel:          widget.NewLabel("DWARF queue: 0"),
 		playbackLabel:            playbackLabel,
 		historyInfo:              historyInfo,
 		historyDetail:            historyDetail,
@@ -388,13 +466,24 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 		objectMapSkipEntry:       objectMapSkipEntry,
 		selectedHistory:          -1,
 		presets:                  make(map[string]TrackingSettings),
+		dwarfDownloadedFiles:     make(map[string]DwarfQueuedRecording),
 		playbackSeekFrame:        -1,
+		dwarfRawWSPayload:        "{\n  \"interface\": 10007,\n  \"camId\": 0,\n  \"name\": \"DWARF_TEST_MANUAL\"\n}",
+		dwarfSessionProbePayload: "{\n  \"clientId\": \"DAF3\",\n  \"type\": \"ping\"\n}",
 	}
 
 	ui.fileButton = widget.NewButtonWithIcon("", theme.FolderOpenIcon(), ui.pickVideoFile)
 	ui.outputButton = widget.NewButtonWithIcon("", theme.FolderOpenIcon(), ui.pickOutputFolder)
+	ui.dwarfDownloadButton = widget.NewButtonWithIcon("", theme.FolderOpenIcon(), ui.pickDwarfDownloadFolder)
 	ui.startButton = widget.NewButtonWithIcon("Start", theme.MediaPlayIcon(), ui.startTracking)
 	ui.stopButton = widget.NewButtonWithIcon("Stop", theme.MediaStopIcon(), ui.stopTracking)
+	ui.startDwarfButton = widget.NewButtonWithIcon("Start Dwarf", theme.MediaRecordIcon(), ui.startDwarfCapture)
+	ui.stopDwarfButton = widget.NewButtonWithIcon("Stop Dwarf", theme.MediaStopIcon(), ui.stopDwarfCapture)
+	ui.fetchDwarfButton = widget.NewButtonWithIcon("Fetch Latest", theme.DownloadIcon(), ui.fetchLatestDwarfVideo)
+	ui.testDwarfButton = widget.NewButtonWithIcon("Test Connection", theme.ViewRefreshIcon(), ui.testDwarfConnection)
+	ui.testDwarfRecordButton = widget.NewButtonWithIcon("Test Record Start", theme.MediaRecordIcon(), ui.testDwarfRecordStart)
+	ui.rawDwarfWSButton = widget.NewButtonWithIcon("Raw WS Command", theme.ComputerIcon(), ui.openRawDwarfWSDialog)
+	ui.sessionProbeButton = widget.NewButtonWithIcon("Session Probe", theme.InfoIcon(), ui.openSessionProbeDialog)
 	ui.resetTrackingButton = widget.NewButtonWithIcon("Reset Tracking Settings", theme.ViewRefreshIcon(), ui.resetTrackingSettings)
 	ui.importTrackingButton = widget.NewButtonWithIcon("Import Settings", theme.FolderOpenIcon(), ui.importTrackingSettings)
 	ui.exportTrackingButton = widget.NewButtonWithIcon("Export Settings", theme.DocumentSaveIcon(), ui.exportTrackingSettings)
@@ -413,6 +502,7 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 	ui.saveObjectNameButton = widget.NewButtonWithIcon("Save Name", theme.DocumentSaveIcon(), ui.saveSelectedObjectName)
 	ui.playPauseButton = widget.NewButtonWithIcon("Pause", theme.MediaPauseIcon(), ui.togglePlaybackPause)
 	ui.stopButton.Disable()
+	ui.stopDwarfButton.Disable()
 	ui.openTrackedButton.Disable()
 	ui.openOriginalButton.Disable()
 	ui.restoreSettingsButton.Disable()
@@ -445,6 +535,10 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 	ui.presetSelect.OnChanged = func(selected string) {
 		ui.presetNameEntry.SetText(selected)
 		ui.updatePresetButtons()
+	}
+	ui.profileSelect.OnChanged = func(selected string) {
+		settings := DefaultTrackingSettingsForProfile(trackingProfileFromLabel(selected))
+		ui.applyTrackingSettingsToForm(settings)
 	}
 	ui.historyList = widget.NewList(
 		func() int {
@@ -521,6 +615,10 @@ func (ui *trackerApp) buildUI() fyne.CanvasObject {
 	urlRow := container.NewBorder(nil, nil, widget.NewLabel("RTSP URL"), nil, ui.urlEntry)
 	fileRow := container.NewBorder(nil, nil, widget.NewLabel("Video File"), ui.fileButton, ui.fileEntry)
 	outputRow := container.NewBorder(nil, nil, widget.NewLabel("Output Dir"), ui.outputButton, ui.outputEntry)
+	dwarfHostRow := container.NewBorder(nil, nil, widget.NewLabel("Dwarf Host"), nil, ui.dwarfHostEntry)
+	dwarfCameraRow := container.NewBorder(nil, nil, widget.NewLabel("Dwarf Camera"), nil, ui.dwarfCameraSelect)
+	dwarfSegmentRow := container.NewBorder(nil, nil, widget.NewLabel("Dwarf Segment Seconds"), nil, ui.dwarfSegmentEntry)
+	dwarfDownloadRow := container.NewBorder(nil, nil, widget.NewLabel("Dwarf Download Dir"), ui.dwarfDownloadButton, ui.dwarfDownloadDirEntry)
 
 	options := container.NewHBox(
 		widget.NewLabel("Fallback FPS"),
@@ -535,6 +633,8 @@ func (ui *trackerApp) buildUI() fyne.CanvasObject {
 			container.NewBorder(nil, nil, widget.NewLabel("Preset Name"), nil, ui.presetNameEntry),
 			container.NewHBox(ui.savePresetButton, ui.applyPresetButton, ui.deletePresetButton),
 			container.NewGridWithColumns(2,
+				container.NewBorder(nil, nil, widget.NewLabel("Tracking Profile"), nil, ui.profileSelect),
+				widget.NewLabel(""),
 				container.NewBorder(nil, nil, widget.NewLabel("Min Area"), nil, ui.minAreaEntry),
 				container.NewBorder(nil, nil, widget.NewLabel("Max Area"), nil, ui.maxAreaEntry),
 				container.NewBorder(nil, nil, widget.NewLabel("Slow Min Speed"), nil, ui.slowSpeedEntry),
@@ -545,10 +645,27 @@ func (ui *trackerApp) buildUI() fyne.CanvasObject {
 				container.NewBorder(nil, nil, widget.NewLabel("Foreground Threshold"), nil, ui.foregroundThresholdEntry),
 				container.NewBorder(nil, nil, widget.NewLabel("Pre Event Seconds"), nil, ui.preEventEntry),
 				container.NewBorder(nil, nil, widget.NewLabel("Post Event Seconds"), nil, ui.postEventEntry),
+				container.NewBorder(nil, nil, widget.NewLabel("Raw Segment Seconds"), nil, ui.rawSegmentEntry),
+				container.NewBorder(nil, nil, widget.NewLabel("Raw Segment Overlap Seconds"), nil, ui.rawSegmentOverlapEntry),
 				container.NewBorder(nil, nil, widget.NewLabel("MOG2 History"), nil, ui.mog2HistoryEntry),
 				container.NewBorder(nil, nil, widget.NewLabel("MOG2 Var Threshold"), nil, ui.mog2VarThresholdEntry),
 				container.NewBorder(nil, nil, widget.NewLabel("ROI Height Fraction"), nil, ui.roiHeightEntry),
 			),
+		)),
+	)
+
+	dwarfCapture := widget.NewAccordion(
+		widget.NewAccordionItem("Dwarf Capture", container.NewVBox(
+			dwarfHostRow,
+			dwarfCameraRow,
+			dwarfSegmentRow,
+			dwarfDownloadRow,
+			ui.dwarfDeleteCheck,
+			ui.dwarfDebugWSCheck,
+			container.NewHBox(ui.startDwarfButton, ui.stopDwarfButton, ui.fetchDwarfButton, ui.testDwarfButton, ui.testDwarfRecordButton),
+			container.NewHBox(ui.rawDwarfWSButton, ui.sessionProbeButton),
+			ui.dwarfStatusLabel,
+			ui.dwarfQueueLabel,
 		)),
 	)
 
@@ -560,6 +677,7 @@ func (ui *trackerApp) buildUI() fyne.CanvasObject {
 		fileRow,
 		outputRow,
 		options,
+		dwarfCapture,
 		trackingSettings,
 		actions,
 	)
@@ -657,7 +775,7 @@ func (ui *trackerApp) refreshSourceControls() {
 func (ui *trackerApp) pickVideoFile() {
 	picker := dialog.NewFileOpen(func(reader fyne.URIReadCloser, err error) {
 		if err != nil {
-			dialog.ShowError(err, ui.window)
+			ui.showError(err)
 			return
 		}
 		if reader == nil {
@@ -674,7 +792,7 @@ func (ui *trackerApp) pickVideoFile() {
 func (ui *trackerApp) pickOutputFolder() {
 	picker := dialog.NewFolderOpen(func(uri fyne.ListableURI, err error) {
 		if err != nil {
-			dialog.ShowError(err, ui.window)
+			ui.showError(err)
 			return
 		}
 		if uri == nil {
@@ -684,6 +802,595 @@ func (ui *trackerApp) pickOutputFolder() {
 		ui.refreshEventHistory()
 	}, ui.window)
 	picker.Show()
+}
+
+func (ui *trackerApp) pickDwarfDownloadFolder() {
+	picker := dialog.NewFolderOpen(func(uri fyne.ListableURI, err error) {
+		if err != nil {
+			ui.showError(err)
+			return
+		}
+		if uri == nil {
+			return
+		}
+		ui.dwarfDownloadDirEntry.SetText(uri.Path())
+	}, ui.window)
+	picker.Show()
+}
+
+func (ui *trackerApp) buildDwarfController() (DwarfController, string, time.Duration, string, error) {
+	segmentSeconds, err := strconv.ParseFloat(ui.dwarfSegmentEntry.Text, 64)
+	if err != nil || segmentSeconds <= 0 {
+		return DwarfController{}, "", 0, "", errors.New("DWARF segment seconds must be a positive number")
+	}
+
+	downloadDir := ui.dwarfDownloadDirEntry.Text
+	if downloadDir == "" {
+		downloadDir = "dwarf_downloads"
+	}
+
+	controller := DefaultDwarfController()
+	if strings.TrimSpace(ui.dwarfHostEntry.Text) != "" {
+		controller.Host = strings.TrimSpace(ui.dwarfHostEntry.Text)
+	}
+	controller.DebugWS = ui.dwarfDebugWSCheck.Checked
+
+	return controller, dwarfCameraFromLabel(ui.dwarfCameraSelect.Selected), time.Duration(segmentSeconds * float64(time.Second)), downloadDir, nil
+}
+
+func (ui *trackerApp) startDwarfCapture() {
+	ui.mu.Lock()
+	if ui.dwarfCaptureRunning {
+		ui.mu.Unlock()
+		return
+	}
+	ui.mu.Unlock()
+
+	controller, camera, segmentDuration, downloadDir, err := ui.buildDwarfController()
+	if err != nil {
+		ui.showError(err)
+		return
+	}
+
+	stopCh := make(chan struct{})
+
+	ui.mu.Lock()
+	ui.dwarfCaptureRunning = true
+	ui.dwarfCaptureStopCh = stopCh
+	ui.mu.Unlock()
+
+	ui.startDwarfButton.Disable()
+	ui.stopDwarfButton.Enable()
+	ui.fetchDwarfButton.Disable()
+	ui.dwarfStatusLabel.SetText("DWARF capture starting...")
+
+	go ui.runDwarfCapture(controller, camera, segmentDuration, downloadDir, stopCh)
+}
+
+func (ui *trackerApp) stopDwarfCapture() {
+	ui.mu.Lock()
+	defer ui.mu.Unlock()
+
+	if !ui.dwarfCaptureRunning || ui.dwarfCaptureStopCh == nil {
+		return
+	}
+
+	close(ui.dwarfCaptureStopCh)
+	ui.dwarfCaptureStopCh = nil
+	ui.dwarfStatusLabel.SetText("DWARF capture stopping...")
+}
+
+func (ui *trackerApp) fetchLatestDwarfVideo() {
+	controller, camera, _, downloadDir, err := ui.buildDwarfController()
+	if err != nil {
+		ui.showError(err)
+		return
+	}
+
+	ui.fetchDwarfButton.Disable()
+	ui.dwarfStatusLabel.SetText("Fetching latest DWARF video...")
+
+	go func() {
+		recording, warningText, fetchErr := ui.downloadLatestDwarfVideo(controller, camera, downloadDir, "", time.Time{})
+		fyne.Do(func() {
+			ui.fetchDwarfButton.Enable()
+			if fetchErr != nil {
+				ui.dwarfStatusLabel.SetText("DWARF fetch failed")
+				ui.showError(fetchErr)
+				return
+			}
+			ui.enqueueDwarfFile(recording)
+			if warningText != "" {
+				ui.dwarfStatusLabel.SetText(warningText)
+				return
+			}
+			ui.dwarfStatusLabel.SetText("Fetched latest DWARF video")
+		})
+	}()
+}
+
+func (ui *trackerApp) testDwarfConnection() {
+	controller, _, _, _, err := ui.buildDwarfController()
+	if err != nil {
+		ui.showError(err)
+		return
+	}
+
+	ui.testDwarfButton.Disable()
+	ui.dwarfStatusLabel.SetText(fmt.Sprintf("Testing DWARF connection to %s...", controller.Host))
+
+	go func() {
+		report := controller.TestConnections()
+		summary := formatDwarfConnectionReport(report)
+
+		fyne.Do(func() {
+			ui.testDwarfButton.Enable()
+			if report.WebSocketOK && report.FTPOK {
+				ui.dwarfStatusLabel.SetText(fmt.Sprintf("DWARF connection OK: %s", report.Host))
+				ui.showInfo("DWARF Connection Test", summary)
+				return
+			}
+
+			ui.dwarfStatusLabel.SetText(fmt.Sprintf("DWARF connection issue: %s", report.Host))
+			ui.showError(errors.New(summary))
+		})
+	}()
+}
+
+func (ui *trackerApp) testDwarfRecordStart() {
+	controller, camera, _, _, err := ui.buildDwarfController()
+	if err != nil {
+		ui.showError(err)
+		return
+	}
+
+	ui.testDwarfRecordButton.Disable()
+	ui.dwarfStatusLabel.SetText(fmt.Sprintf("Testing DWARF record start on %s...", controller.Host))
+
+	go func() {
+		report := controller.TestRecordStart(camera, 4*time.Second)
+		summary := formatDwarfRecordStartReport(report)
+
+		fyne.Do(func() {
+			ui.testDwarfRecordButton.Enable()
+			if report.StartAckOK && report.StopAckOK && len(report.NewFiles) > 0 && report.ListAfterErr == "" {
+				ui.dwarfStatusLabel.SetText(fmt.Sprintf("DWARF record test OK: %s", report.Host))
+				ui.showInfo("DWARF Record Start Test", summary)
+				return
+			}
+
+			ui.dwarfStatusLabel.SetText(fmt.Sprintf("DWARF record test issue: %s", report.Host))
+			ui.showError(errors.New(summary))
+		})
+	}()
+}
+
+func (ui *trackerApp) openRawDwarfWSDialog() {
+	ui.openDwarfWSDialog(
+		"Raw DWARF WS Command",
+		"Send arbitrary JSON to the DWARF websocket endpoint.",
+		ui.dwarfRawWSPayload,
+		true,
+		func(payload string, allowTimeoutSuccess bool) {
+			ui.dwarfRawWSPayload = payload
+			ui.runDwarfRawWSCommand("Raw DWARF WS Command", payload, allowTimeoutSuccess)
+		},
+	)
+}
+
+func (ui *trackerApp) openSessionProbeDialog() {
+	ui.openDwarfWSDialog(
+		"DWARF Session Probe",
+		"Reusable probe payload for keepalive/session-init tests.",
+		ui.dwarfSessionProbePayload,
+		false,
+		func(payload string, allowTimeoutSuccess bool) {
+			ui.dwarfSessionProbePayload = payload
+			ui.runDwarfRawWSCommand("DWARF Session Probe", payload, allowTimeoutSuccess)
+		},
+	)
+}
+
+func (ui *trackerApp) openDwarfWSDialog(title string, helpText string, initialPayload string, allowTimeoutDefault bool, onSubmit func(payload string, allowTimeoutSuccess bool)) {
+	payloadEntry := widget.NewMultiLineEntry()
+	payloadEntry.SetText(initialPayload)
+	payloadEntry.Wrapping = fyne.TextWrapWord
+	payloadEntry.SetMinRowsVisible(10)
+
+	timeoutCheck := widget.NewCheck("Treat timeout as success", nil)
+	timeoutCheck.SetChecked(allowTimeoutDefault)
+
+	content := container.NewVBox(
+		widget.NewLabel(helpText),
+		payloadEntry,
+		timeoutCheck,
+	)
+
+	dialog.NewCustomConfirm(title, "Send", "Cancel", content, func(confirmed bool) {
+		if !confirmed {
+			return
+		}
+		onSubmit(payloadEntry.Text, timeoutCheck.Checked)
+	}, ui.window).Show()
+}
+
+func (ui *trackerApp) runDwarfRawWSCommand(title string, payload string, allowTimeoutSuccess bool) {
+	controller, _, _, _, err := ui.buildDwarfController()
+	if err != nil {
+		ui.showError(err)
+		return
+	}
+
+	ui.rawDwarfWSButton.Disable()
+	ui.sessionProbeButton.Disable()
+	ui.dwarfStatusLabel.SetText(fmt.Sprintf("Sending DWARF websocket command to %s...", controller.Host))
+
+	go func() {
+		report := controller.SendRawWSCommand(payload, allowTimeoutSuccess)
+		summary := formatDwarfRawWSReport(report)
+
+		fyne.Do(func() {
+			ui.rawDwarfWSButton.Enable()
+			ui.sessionProbeButton.Enable()
+			if report.Err == "" {
+				ui.dwarfStatusLabel.SetText(fmt.Sprintf("DWARF websocket response received from %s", report.Host))
+				ui.showInfo(title, summary)
+				return
+			}
+			ui.dwarfStatusLabel.SetText(fmt.Sprintf("DWARF websocket command failed: %s", report.Host))
+			ui.showError(errors.New(summary))
+		})
+	}()
+}
+
+func (ui *trackerApp) runDwarfCapture(controller DwarfController, camera string, segmentDuration time.Duration, downloadDir string, stopCh <-chan struct{}) {
+	var runErr error
+
+	for {
+		recordingName := fmt.Sprintf("DWARF_%s", time.Now().Format("20060102150405"))
+		recordingStartedAt := time.Now()
+		if _, err := controller.StartVideoRecording(camera, recordingName); err != nil {
+			runErr = err
+			break
+		}
+
+		fyne.Do(func() {
+			ui.dwarfStatusLabel.SetText(fmt.Sprintf("DWARF %s recording: %s", strings.ToUpper(camera), recordingName))
+		})
+
+		timer := time.NewTimer(segmentDuration)
+		stopRequested := false
+		select {
+		case <-stopCh:
+			stopRequested = true
+		case <-timer.C:
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+
+		if _, err := controller.StopVideoRecording(camera); err != nil {
+			runErr = err
+			break
+		}
+
+		fyne.Do(func() {
+			ui.dwarfStatusLabel.SetText(fmt.Sprintf("DWARF %s finalizing: %s", strings.ToUpper(camera), recordingName))
+		})
+
+		time.Sleep(3 * time.Second)
+
+		recording, warningText, err := ui.downloadLatestDwarfVideo(controller, camera, downloadDir, recordingName, recordingStartedAt)
+		if err == nil {
+			fyne.Do(func() {
+				ui.enqueueDwarfFile(recording)
+				if warningText != "" {
+					ui.dwarfStatusLabel.SetText(warningText)
+					return
+				}
+				ui.dwarfStatusLabel.SetText(fmt.Sprintf("DWARF queued: %s (%s)", filepath.Base(recording.LocalPath), strings.ToUpper(recording.Camera)))
+			})
+		} else {
+			fyne.Do(func() {
+				ui.dwarfStatusLabel.SetText("DWARF download failed")
+			})
+			runErr = err
+			break
+		}
+
+		if stopRequested {
+			break
+		}
+	}
+
+	fyne.Do(func() {
+		ui.finishDwarfCapture(runErr)
+	})
+}
+
+func (ui *trackerApp) finishDwarfCapture(err error) {
+	ui.mu.Lock()
+	ui.dwarfCaptureRunning = false
+	ui.dwarfCaptureStopCh = nil
+	ui.mu.Unlock()
+
+	ui.startDwarfButton.Enable()
+	ui.stopDwarfButton.Disable()
+	ui.fetchDwarfButton.Enable()
+
+	switch {
+	case err == nil || errors.Is(err, ErrStopTracking):
+		if len(ui.dwarfQueuedFiles) > 0 {
+			ui.dwarfStatusLabel.SetText("DWARF capture idle")
+		} else {
+			ui.dwarfStatusLabel.SetText("DWARF idle")
+		}
+	default:
+		ui.dwarfStatusLabel.SetText("DWARF capture error")
+		ui.showError(err)
+	}
+}
+
+func (ui *trackerApp) downloadLatestDwarfVideo(controller DwarfController, camera string, downloadDir string, recordingName string, recordingStartedAt time.Time) (DwarfQueuedRecording, string, error) {
+	ui.mu.Lock()
+	downloaded := make(map[string]DwarfQueuedRecording, len(ui.dwarfDownloadedFiles))
+	for key, value := range ui.dwarfDownloadedFiles {
+		downloaded[key] = value
+	}
+	ui.mu.Unlock()
+
+	selected, err := findDwarfMediaFileForDownload(controller, downloaded, camera, recordingName, recordingStartedAt)
+	if err != nil {
+		return DwarfQueuedRecording{}, "", err
+	}
+	if selected == nil {
+		return DwarfQueuedRecording{}, "", errors.New("no new DWARF video file available for download")
+	}
+
+	localPath := filepath.Join(downloadDir, filepath.Base(selected.Path))
+	if err := controller.DownloadFile(selected.Path, localPath); err != nil {
+		return DwarfQueuedRecording{}, "", err
+	}
+
+	recording := DwarfQueuedRecording{
+		Camera:          normalizeDwarfCamera(camera),
+		RemotePath:      selected.Path,
+		RemoteName:      selected.Name,
+		LocalPath:       localPath,
+		RecordingName:   recordingName,
+		RecordingStart:  recordingStartedAt,
+		DownloadedAt:    time.Now(),
+		DeleteRequested: false,
+	}
+
+	ui.mu.Lock()
+	deleteRemote := ui.dwarfDeleteCheck.Checked
+	recording.DeleteRequested = deleteRemote
+	ui.dwarfDownloadedFiles[selected.Path] = recording
+	ui.mu.Unlock()
+
+	if !deleteRemote {
+		return recording, "", nil
+	}
+
+	if err := controller.DeleteFile(selected.Path); err != nil {
+		return recording, fmt.Sprintf("Downloaded %s (%s) but remote delete failed: %v", filepath.Base(localPath), strings.ToUpper(recording.Camera), err), nil
+	}
+
+	return recording, "", nil
+}
+
+func findDwarfMediaFileForDownload(controller DwarfController, downloaded map[string]DwarfQueuedRecording, camera string, recordingName string, recordingStartedAt time.Time) (*DwarfMediaFile, error) {
+	waitUntil := time.Now()
+	if recordingName != "" {
+		waitUntil = waitUntil.Add(90 * time.Second)
+	}
+
+	for {
+		files, err := controller.ListVideoFiles()
+		if err != nil {
+			return nil, err
+		}
+
+		selected := selectDwarfMediaFile(files, downloaded, camera, recordingName, recordingStartedAt)
+		if selected != nil {
+			return selected, nil
+		}
+
+		if recordingName == "" || time.Now().After(waitUntil) {
+			return nil, nil
+		}
+
+		time.Sleep(3 * time.Second)
+	}
+}
+
+func formatDwarfConnectionReport(report DwarfConnectionReport) string {
+	return fmt.Sprintf(
+		"Host: %s\nWebSocket %s:%d: %s\nFTP %s:%d: %s",
+		report.Host,
+		report.Host,
+		report.WSPort,
+		connectionStatusText(report.WebSocketOK, report.WebSocketDetail),
+		report.Host,
+		report.FTPPort,
+		connectionStatusText(report.FTPOK, report.FTPDetail),
+	)
+}
+
+func connectionStatusText(ok bool, detail string) string {
+	status := "FAILED"
+	if ok {
+		status = "OK"
+	}
+	if strings.TrimSpace(detail) == "" {
+		return status
+	}
+	return fmt.Sprintf("%s (%s)", status, detail)
+}
+
+func formatDwarfRecordStartReport(report DwarfRecordStartReport) string {
+	lines := []string{
+		fmt.Sprintf("Host: %s", report.Host),
+		fmt.Sprintf("Camera: %s", strings.ToUpper(report.Camera)),
+		fmt.Sprintf("Recording Name: %s", report.RecordingName),
+		fmt.Sprintf("Wait: %s", report.WaitDuration),
+		fmt.Sprintf("Start Ack: %s", connectionStatusText(report.StartAckOK, report.StartAckDetail)),
+		fmt.Sprintf("Stop Ack: %s", connectionStatusText(report.StopAckOK, report.StopAckDetail)),
+	}
+
+	if strings.TrimSpace(report.StartAckRaw) != "" {
+		lines = append(lines, fmt.Sprintf("Start Ack Raw: %s", report.StartAckRaw))
+	}
+	if strings.TrimSpace(report.StopAckRaw) != "" {
+		lines = append(lines, fmt.Sprintf("Stop Ack Raw: %s", report.StopAckRaw))
+	}
+
+	if strings.TrimSpace(report.ListBeforeErr) != "" {
+		lines = append(lines, fmt.Sprintf("FTP Before List: FAILED (%s)", report.ListBeforeErr))
+	} else {
+		lines = append(lines, fmt.Sprintf("FTP Before List Count: %d", report.BeforeCount))
+	}
+
+	if strings.TrimSpace(report.ListAfterErr) != "" {
+		lines = append(lines, fmt.Sprintf("FTP After List: FAILED (%s)", report.ListAfterErr))
+	} else {
+		lines = append(lines, fmt.Sprintf("FTP After List Count: %d", report.AfterCount))
+	}
+
+	if len(report.NewFiles) == 0 {
+		lines = append(lines, "New Files: none")
+	} else {
+		lines = append(lines, fmt.Sprintf("New Files: %s", strings.Join(report.NewFiles, ", ")))
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+func formatDwarfRawWSReport(report DwarfRawWSReport) string {
+	lines := []string{
+		fmt.Sprintf("Host: %s", report.Host),
+		fmt.Sprintf("WebSocket Port: %d", report.WSPort),
+		fmt.Sprintf("Treat Timeout As Success: %t", report.AllowTimeoutSuccess),
+		fmt.Sprintf("Payload: %s", report.Payload),
+	}
+
+	if strings.TrimSpace(report.ResponseRaw) != "" {
+		lines = append(lines, fmt.Sprintf("Response Raw: %s", report.ResponseRaw))
+	} else {
+		lines = append(lines, "Response Raw: <empty>")
+	}
+
+	if strings.TrimSpace(report.Err) != "" {
+		lines = append(lines, fmt.Sprintf("Error: %s", report.Err))
+	} else {
+		lines = append(lines, "Error: <none>")
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+func selectDwarfMediaFile(files []DwarfMediaFile, downloaded map[string]DwarfQueuedRecording, camera string, recordingName string, recordingStartedAt time.Time) *DwarfMediaFile {
+	if recordingName != "" {
+		for i := range files {
+			if _, seen := downloaded[files[i].Path]; seen {
+				continue
+			}
+			if dwarfMediaMatchesRecording(files[i], camera, recordingName, recordingStartedAt) {
+				return &files[i]
+			}
+		}
+	}
+
+	for i := range files {
+		if _, seen := downloaded[files[i].Path]; seen {
+			continue
+		}
+		if !dwarfMediaMatchesCamera(files[i], camera) {
+			continue
+		}
+		return &files[i]
+	}
+	return nil
+}
+
+func dwarfMediaMatchesRecording(file DwarfMediaFile, camera string, recordingName string, recordingStartedAt time.Time) bool {
+	if !dwarfMediaMatchesCamera(file, camera) {
+		return false
+	}
+
+	baseName := strings.TrimSuffix(file.Name, filepath.Ext(file.Name))
+	if baseName == recordingName || strings.HasPrefix(baseName, recordingName) || strings.Contains(baseName, recordingName) {
+		return true
+	}
+
+	if !recordingStartedAt.IsZero() {
+		if recordedAt, ok := parseDwarfVideoTimestamp(file.Name); ok {
+			delta := recordedAt.Sub(recordingStartedAt)
+			if delta < 0 {
+				delta = -delta
+			}
+			if delta <= 15*time.Second {
+				return true
+			}
+		}
+	}
+
+	if !recordingStartedAt.IsZero() && !file.ModTime.IsZero() {
+		// Fall back to FTP modtime if the filename could not be parsed.
+		if !file.ModTime.Before(recordingStartedAt.Add(-10 * time.Second)) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func parseDwarfVideoTimestamp(fileName string) (time.Time, bool) {
+	baseName := strings.TrimSuffix(filepath.Base(fileName), filepath.Ext(fileName))
+	for _, prefix := range []string{"DWARF3_TELE_", "DWARF3_WIDE_", "DWARF_TELE_", "DWARF_WIDE_"} {
+		if !strings.HasPrefix(baseName, prefix) {
+			continue
+		}
+
+		stamp := strings.TrimPrefix(baseName, prefix)
+		parsed, err := time.ParseInLocation("2006-01-02-15-04-05-000", stamp, time.Local)
+		if err == nil {
+			return parsed, true
+		}
+	}
+	return time.Time{}, false
+}
+
+func dwarfMediaMatchesCamera(file DwarfMediaFile, camera string) bool {
+	name := strings.TrimSuffix(filepath.Base(file.Name), filepath.Ext(file.Name))
+	for _, prefix := range dwarfCameraFilePrefixes(camera) {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func dwarfCameraFromLabel(label string) string {
+	switch strings.ToLower(strings.TrimSpace(label)) {
+	case "wide":
+		return dwarfCameraWide
+	default:
+		return dwarfCameraTele
+	}
+}
+
+func (ui *trackerApp) enqueueDwarfFile(recording DwarfQueuedRecording) {
+	ui.mu.Lock()
+	ui.dwarfQueuedFiles = append(ui.dwarfQueuedFiles, recording)
+	queueCount := len(ui.dwarfQueuedFiles)
+	ui.mu.Unlock()
+
+	ui.dwarfQueueLabel.SetText(fmt.Sprintf("DWARF queue: %d   latest: %s (%s)", queueCount, filepath.Base(recording.LocalPath), strings.ToUpper(recording.Camera)))
 }
 
 func (ui *trackerApp) startTracking() {
@@ -696,7 +1403,7 @@ func (ui *trackerApp) startTracking() {
 
 	config, err := ui.buildConfig()
 	if err != nil {
-		dialog.ShowError(err, ui.window)
+		ui.showError(err)
 		return
 	}
 
@@ -916,12 +1623,13 @@ func (ui *trackerApp) buildConfig() (TrackerConfig, error) {
 			return TrackerConfig{}, errors.New("video file path is required")
 		}
 		return TrackerConfig{
-			Input:       ui.fileEntry.Text,
-			InputLabel:  "video file",
-			OutputDir:   outputDir,
-			ShowMask:    ui.showMask.Checked,
-			FallbackFPS: fallbackFPS,
-			Settings:    settings,
+			Input:        ui.fileEntry.Text,
+			InputLabel:   "video file",
+			OutputDir:    outputDir,
+			ShowMask:     ui.showMask.Checked,
+			RecordEvents: true,
+			FallbackFPS:  fallbackFPS,
+			Settings:     settings,
 		}, nil
 	}
 
@@ -930,12 +1638,13 @@ func (ui *trackerApp) buildConfig() (TrackerConfig, error) {
 	}
 
 	return TrackerConfig{
-		Input:       ui.urlEntry.Text,
-		InputLabel:  "DWARF 3 live stream",
-		OutputDir:   outputDir,
-		ShowMask:    ui.showMask.Checked,
-		FallbackFPS: fallbackFPS,
-		Settings:    settings,
+		Input:        ui.urlEntry.Text,
+		InputLabel:   "DWARF 3 live stream",
+		OutputDir:    outputDir,
+		ShowMask:     ui.showMask.Checked,
+		RecordEvents: true,
+		FallbackFPS:  fallbackFPS,
+		Settings:     settings,
 	}, nil
 }
 
@@ -1018,6 +1727,19 @@ func (ui *trackerApp) runTracker(config TrackerConfig, stopCh chan struct{}) {
 	}
 
 	err := engine.Run()
+	if err == nil && config.InputLabel == "video file" && NormalizeTrackingSettings(config.Settings).RawSegmentDuration > 0 && engine.RawSegmentDir != "" {
+		fyne.Do(func() {
+			ui.statusLabel.SetText("Processing raw segments in parallel...")
+		})
+		_, processErr := processRawSegmentsParallel(engine.RawSegmentDir, config.Settings, config.FallbackFPS, stopCh)
+		if processErr != nil {
+			err = processErr
+		} else {
+			fyne.Do(func() {
+				ui.eventLabel.SetText("Merged segment tracking: " + filepath.Join(engine.RawSegmentDir, "processed", "merged_tracking.json"))
+			})
+		}
+	}
 
 	fyne.Do(func() {
 		ui.finishRun(err, "Idle")
@@ -1268,7 +1990,7 @@ func (ui *trackerApp) finishRun(err error, idleText string) {
 		ui.statusLabel.SetText(idleText)
 	default:
 		ui.statusLabel.SetText("Stopped with error")
-		dialog.ShowError(err, ui.window)
+		ui.showError(err)
 	}
 }
 
@@ -1285,7 +2007,7 @@ func (ui *trackerApp) refreshEventHistory() {
 		ui.openTrackedButton.Disable()
 		ui.openOriginalButton.Disable()
 		ui.restoreSettingsButton.Disable()
-		dialog.ShowError(err, ui.window)
+		ui.showError(err)
 		return
 	}
 
@@ -1345,19 +2067,19 @@ func (ui *trackerApp) openSelectedEventVideo(tracked bool) {
 	ui.mu.Unlock()
 
 	if running {
-		dialog.ShowInformation("Busy", "Stop the current tracker or playback first.", ui.window)
+		ui.showInfo("Busy", "Stop the current tracker or playback first.")
 		return
 	}
 
 	if ui.selectedHistory < 0 || ui.selectedHistory >= len(ui.historyEntries) {
-		dialog.ShowInformation("No Event Selected", "Select an event from the history list first.", ui.window)
+		ui.showInfo("No Event Selected", "Select an event from the history list first.")
 		return
 	}
 
 	entry := ui.historyEntries[ui.selectedHistory]
 	detail, err := loadEventDetail(entry)
 	if err != nil {
-		dialog.ShowError(err, ui.window)
+		ui.showError(err)
 		return
 	}
 	filename := "original.avi"
@@ -1379,7 +2101,7 @@ func (ui *trackerApp) openSelectedEventVideo(tracked bool) {
 
 	path := filepath.Join(entry.Directory, filename)
 	if _, err := os.Stat(path); err != nil {
-		dialog.ShowError(fmt.Errorf("open %s: %w", filename, err), ui.window)
+		ui.showError(fmt.Errorf("open %s: %w", filename, err))
 		return
 	}
 
@@ -1459,14 +2181,14 @@ func (ui *trackerApp) applyHistoryFilters() {
 
 func (ui *trackerApp) restoreSettingsFromSelectedEvent() {
 	if ui.selectedHistory < 0 || ui.selectedHistory >= len(ui.historyEntries) {
-		dialog.ShowInformation("No Event Selected", "Select an event from the history list first.", ui.window)
+		ui.showInfo("No Event Selected", "Select an event from the history list first.")
 		return
 	}
 
 	entry := ui.historyEntries[ui.selectedHistory]
 	detail, err := loadEventDetail(entry)
 	if err != nil {
-		dialog.ShowError(err, ui.window)
+		ui.showError(err)
 		return
 	}
 
@@ -1485,7 +2207,7 @@ func (ui *trackerApp) resetTrackingSettings() {
 func (ui *trackerApp) importTrackingSettings() {
 	picker := dialog.NewFileOpen(func(reader fyne.URIReadCloser, err error) {
 		if err != nil {
-			dialog.ShowError(err, ui.window)
+			ui.showError(err)
 			return
 		}
 		if reader == nil {
@@ -1495,7 +2217,7 @@ func (ui *trackerApp) importTrackingSettings() {
 
 		var settings TrackingSettings
 		if err := json.NewDecoder(reader).Decode(&settings); err != nil {
-			dialog.ShowError(fmt.Errorf("decode tracking settings: %w", err), ui.window)
+			ui.showError(fmt.Errorf("decode tracking settings: %w", err))
 			return
 		}
 
@@ -1511,13 +2233,13 @@ func (ui *trackerApp) importTrackingSettings() {
 func (ui *trackerApp) exportTrackingSettings() {
 	settings, err := ui.buildTrackingSettings()
 	if err != nil {
-		dialog.ShowError(err, ui.window)
+		ui.showError(err)
 		return
 	}
 
 	saver := dialog.NewFileSave(func(writer fyne.URIWriteCloser, err error) {
 		if err != nil {
-			dialog.ShowError(err, ui.window)
+			ui.showError(err)
 			return
 		}
 		if writer == nil {
@@ -1528,7 +2250,7 @@ func (ui *trackerApp) exportTrackingSettings() {
 		encoder := json.NewEncoder(writer)
 		encoder.SetIndent("", "  ")
 		if err := encoder.Encode(settings); err != nil {
-			dialog.ShowError(fmt.Errorf("write tracking settings: %w", err), ui.window)
+			ui.showError(fmt.Errorf("write tracking settings: %w", err))
 			return
 		}
 
@@ -1574,6 +2296,8 @@ func (ui *trackerApp) loadTrackingPreferences() {
 	ui.foregroundThresholdEntry.SetText(prefs.StringWithFallback(prefTrackingThreshold, formatFloat(defaults.ForegroundThreshold)))
 	ui.preEventEntry.SetText(prefs.StringWithFallback(prefTrackingPreEvent, formatFloat(defaults.PreEventDuration.Seconds())))
 	ui.postEventEntry.SetText(prefs.StringWithFallback(prefTrackingPostEvent, formatFloat(defaults.PostEventDuration.Seconds())))
+	ui.rawSegmentEntry.SetText(prefs.StringWithFallback(prefTrackingRawSegment, formatFloat(defaults.RawSegmentDuration.Seconds())))
+	ui.rawSegmentOverlapEntry.SetText(prefs.StringWithFallback(prefTrackingRawOverlap, formatFloat(defaults.RawSegmentOverlap.Seconds())))
 	ui.mog2HistoryEntry.SetText(prefs.StringWithFallback(prefTrackingMOG2History, strconv.Itoa(defaults.MOG2History)))
 	ui.mog2VarThresholdEntry.SetText(prefs.StringWithFallback(prefTrackingMOG2Var, formatFloat(defaults.MOG2VarThreshold)))
 	ui.roiHeightEntry.SetText(prefs.StringWithFallback(prefTrackingROIHeight, formatFloat(defaults.TrackingROIHeightFrac)))
@@ -1591,6 +2315,8 @@ func (ui *trackerApp) saveTrackingPreferences() {
 	prefs.SetString(prefTrackingThreshold, ui.foregroundThresholdEntry.Text)
 	prefs.SetString(prefTrackingPreEvent, ui.preEventEntry.Text)
 	prefs.SetString(prefTrackingPostEvent, ui.postEventEntry.Text)
+	prefs.SetString(prefTrackingRawSegment, ui.rawSegmentEntry.Text)
+	prefs.SetString(prefTrackingRawOverlap, ui.rawSegmentOverlapEntry.Text)
 	prefs.SetString(prefTrackingMOG2History, ui.mog2HistoryEntry.Text)
 	prefs.SetString(prefTrackingMOG2Var, ui.mog2VarThresholdEntry.Text)
 	prefs.SetString(prefTrackingROIHeight, ui.roiHeightEntry.Text)
@@ -1647,6 +2373,7 @@ func (ui *trackerApp) updatePresetButtons() {
 
 func (ui *trackerApp) applyTrackingSettingsToForm(settings TrackingSettings) {
 	settings = NormalizeTrackingSettings(settings)
+	ui.profileSelect.SetSelected(trackingProfileLabel(settings.Profile))
 	ui.minAreaEntry.SetText(formatFloat(settings.MinArea))
 	ui.maxAreaEntry.SetText(formatFloat(settings.MaxArea))
 	ui.slowSpeedEntry.SetText(formatFloat(settings.SlowMinSpeed))
@@ -1657,13 +2384,15 @@ func (ui *trackerApp) applyTrackingSettingsToForm(settings TrackingSettings) {
 	ui.foregroundThresholdEntry.SetText(formatFloat(settings.ForegroundThreshold))
 	ui.preEventEntry.SetText(formatFloat(settings.PreEventDuration.Seconds()))
 	ui.postEventEntry.SetText(formatFloat(settings.PostEventDuration.Seconds()))
+	ui.rawSegmentEntry.SetText(formatFloat(settings.RawSegmentDuration.Seconds()))
+	ui.rawSegmentOverlapEntry.SetText(formatFloat(settings.RawSegmentOverlap.Seconds()))
 	ui.mog2HistoryEntry.SetText(strconv.Itoa(settings.MOG2History))
 	ui.mog2VarThresholdEntry.SetText(formatFloat(settings.MOG2VarThreshold))
 	ui.roiHeightEntry.SetText(formatFloat(settings.TrackingROIHeightFrac))
 }
 
 func (ui *trackerApp) buildTrackingSettings() (TrackingSettings, error) {
-	settings := DefaultTrackingSettings()
+	settings := DefaultTrackingSettingsForProfile(trackingProfileFromLabel(ui.profileSelect.Selected))
 
 	var err error
 	if settings.MinArea, err = parseRequiredFloat(ui.minAreaEntry.Text, "Min Area"); err != nil {
@@ -1698,6 +2427,14 @@ func (ui *trackerApp) buildTrackingSettings() (TrackingSettings, error) {
 	if err != nil {
 		return TrackingSettings{}, err
 	}
+	rawSegmentSeconds, err := parseRequiredFloat(ui.rawSegmentEntry.Text, "Raw Segment Seconds")
+	if err != nil {
+		return TrackingSettings{}, err
+	}
+	rawSegmentOverlapSeconds, err := parseRequiredFloat(ui.rawSegmentOverlapEntry.Text, "Raw Segment Overlap Seconds")
+	if err != nil {
+		return TrackingSettings{}, err
+	}
 	if settings.MOG2History, err = parseRequiredInt(ui.mog2HistoryEntry.Text, "MOG2 History"); err != nil {
 		return TrackingSettings{}, err
 	}
@@ -1710,6 +2447,8 @@ func (ui *trackerApp) buildTrackingSettings() (TrackingSettings, error) {
 
 	settings.PreEventDuration = time.Duration(preEventSeconds * float64(time.Second))
 	settings.PostEventDuration = time.Duration(postEventSeconds * float64(time.Second))
+	settings.RawSegmentDuration = time.Duration(rawSegmentSeconds * float64(time.Second))
+	settings.RawSegmentOverlap = time.Duration(rawSegmentOverlapSeconds * float64(time.Second))
 
 	if settings.MinArea < 0 || settings.MaxArea <= settings.MinArea {
 		return TrackingSettings{}, errors.New("Max Area must be greater than Min Area")
@@ -1723,8 +2462,11 @@ func (ui *trackerApp) buildTrackingSettings() (TrackingSettings, error) {
 	if settings.BlurSize < 1 || settings.BlurSize%2 == 0 {
 		return TrackingSettings{}, errors.New("Blur Size must be a positive odd integer")
 	}
-	if settings.PreEventDuration < 0 || settings.PostEventDuration < 0 {
-		return TrackingSettings{}, errors.New("Pre/Post Event Seconds must be non-negative")
+	if settings.PreEventDuration < 0 || settings.PostEventDuration < 0 || settings.RawSegmentDuration < 0 || settings.RawSegmentOverlap < 0 {
+		return TrackingSettings{}, errors.New("Pre/Post Event and Raw Segment Seconds must be non-negative")
+	}
+	if settings.RawSegmentDuration > 0 && settings.RawSegmentOverlap >= settings.RawSegmentDuration {
+		return TrackingSettings{}, errors.New("Raw Segment Overlap Seconds must be smaller than Raw Segment Seconds")
 	}
 	if settings.MOG2History < 1 {
 		return TrackingSettings{}, errors.New("MOG2 History must be at least 1")
@@ -1740,12 +2482,12 @@ func (ui *trackerApp) buildTrackingSettings() (TrackingSettings, error) {
 func (ui *trackerApp) saveTrackingPreset() {
 	name := ui.presetNameEntry.Text
 	if name == "" {
-		dialog.ShowInformation("Preset Name Required", "Enter a preset name first.", ui.window)
+		ui.showInfo("Preset Name Required", "Enter a preset name first.")
 		return
 	}
 	settings, err := ui.buildTrackingSettings()
 	if err != nil {
-		dialog.ShowError(err, ui.window)
+		ui.showError(err)
 		return
 	}
 
@@ -1779,7 +2521,7 @@ func (ui *trackerApp) applySelectedPreset() {
 	name := ui.presetSelect.Selected
 	settings, ok := ui.presets[name]
 	if !ok || name == "" {
-		dialog.ShowInformation("No Preset Selected", "Select a preset first.", ui.window)
+		ui.showInfo("No Preset Selected", "Select a preset first.")
 		return
 	}
 	ui.applyTrackingSettingsToForm(settings)
@@ -1791,7 +2533,7 @@ func (ui *trackerApp) applySelectedPreset() {
 func (ui *trackerApp) deleteSelectedPreset() {
 	name := ui.presetSelect.Selected
 	if name == "" {
-		dialog.ShowInformation("No Preset Selected", "Select a preset first.", ui.window)
+		ui.showInfo("No Preset Selected", "Select a preset first.")
 		return
 	}
 	delete(ui.presets, name)
@@ -1917,26 +2659,26 @@ func (ui *trackerApp) watchSelectedObject() {
 	running := ui.running
 	ui.mu.Unlock()
 	if running {
-		dialog.ShowInformation("Busy", "Stop the current tracker or playback first.", ui.window)
+		ui.showInfo("Busy", "Stop the current tracker or playback first.")
 		return
 	}
 
 	object, ok := ui.selectedObject()
 	if !ok {
-		dialog.ShowInformation("No Object Selected", "Select an object first.", ui.window)
+		ui.showInfo("No Object Selected", "Select an object first.")
 		return
 	}
 	if ui.currentDetail == nil || ui.currentDetail.Tracking == nil || !ui.currentDetail.HasTracking {
-		dialog.ShowInformation("No Tracking Metadata", "No saved tracking metadata was found for the selected object.", ui.window)
+		ui.showInfo("No Tracking Metadata", "No saved tracking metadata was found for the selected object.")
 		return
 	}
 	objectMapSkipCount, err := parseRequiredInt(ui.objectMapSkipEntry.Text, "Object Map Skip")
 	if err != nil {
-		dialog.ShowError(err, ui.window)
+		ui.showError(err)
 		return
 	}
 	if objectMapSkipCount < 0 {
-		dialog.ShowError(errors.New("Object Map Skip must be 0 or greater"), ui.window)
+		ui.showError(errors.New("Object Map Skip must be 0 or greater"))
 		return
 	}
 
@@ -1946,7 +2688,7 @@ func (ui *trackerApp) watchSelectedObject() {
 		videoPath = filepath.Join(entry.Directory, "original.avi")
 	}
 	if _, err := os.Stat(videoPath); err != nil {
-		dialog.ShowError(fmt.Errorf("open original video: %w", err), ui.window)
+		ui.showError(fmt.Errorf("open original video: %w", err))
 		return
 	}
 	maskPath := filepath.Join(entry.Directory, ui.currentDetail.Summary.MaskedVideo)
@@ -1982,12 +2724,12 @@ func (ui *trackerApp) watchSelectedObject() {
 
 func (ui *trackerApp) saveSelectedObjectName() {
 	if ui.currentDetail == nil || ui.selectedHistory < 0 || ui.selectedHistory >= len(ui.historyEntries) {
-		dialog.ShowInformation("No Event Selected", "Select an event first.", ui.window)
+		ui.showInfo("No Event Selected", "Select an event first.")
 		return
 	}
 	object, ok := ui.selectedObject()
 	if !ok {
-		dialog.ShowInformation("No Object Selected", "Select an object first.", ui.window)
+		ui.showInfo("No Object Selected", "Select an object first.")
 		return
 	}
 
@@ -1999,7 +2741,7 @@ func (ui *trackerApp) saveSelectedObjectName() {
 	}
 
 	if err := saveTrackNames(trackNamesPath, ui.currentDetail.TrackNames, object.ID, name); err != nil {
-		dialog.ShowError(err, ui.window)
+		ui.showError(err)
 		return
 	}
 
@@ -2462,6 +3204,8 @@ func formatEventDetail(detail eventHistoryDetail, dir string) string {
 	lines = append(lines, fmt.Sprintf("  Foreground Threshold: %s", formatFloat(settings.ForegroundThreshold)))
 	lines = append(lines, fmt.Sprintf("  Pre Event Seconds: %s", formatFloat(settings.PreEventDuration.Seconds())))
 	lines = append(lines, fmt.Sprintf("  Post Event Seconds: %s", formatFloat(settings.PostEventDuration.Seconds())))
+	lines = append(lines, fmt.Sprintf("  Raw Segment Seconds: %s", formatFloat(settings.RawSegmentDuration.Seconds())))
+	lines = append(lines, fmt.Sprintf("  Raw Segment Overlap Seconds: %s", formatFloat(settings.RawSegmentOverlap.Seconds())))
 	lines = append(lines, fmt.Sprintf("  MOG2 History: %d", settings.MOG2History))
 	lines = append(lines, fmt.Sprintf("  MOG2 Var Threshold: %s", formatFloat(settings.MOG2VarThreshold)))
 	lines = append(lines, fmt.Sprintf("  ROI Height Fraction: %s", formatFloat(settings.TrackingROIHeightFrac)))

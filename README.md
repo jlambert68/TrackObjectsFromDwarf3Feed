@@ -15,6 +15,11 @@ The program does not continuously record video. It keeps about 5 seconds of clea
 frames in RAM. When a valid fast track appears it writes that prebuffer, records
 while objects are present, and continues for 5 seconds after the last tracked object.
 
+It can also optionally save overlapping raw video segments for later offline or
+parallel processing. When enabled, the tracker writes `raw_segments/<session>/`
+with fixed-length `.avi` files plus a `manifest.json` describing the segment
+frame ranges and overlap.
+
 ## Run
 
 Make sure OpenCV compatible with GoCV v0.43.0 is installed.
@@ -73,6 +78,8 @@ They are constants near the top of `main.go`:
 - `maxMatchDistance`: raise it if very fast targets repeatedly receive new IDs.
 - `preEventDuration`: amount retained before detection.
 - `postEventDuration`: amount retained after the last valid track disappears.
+- `rawSegmentDuration`: optional continuous raw-video snippet length. `0` disables it.
+- `rawSegmentOverlap`: overlap between consecutive raw snippets.
 
 ## Important telescope limitation
 
