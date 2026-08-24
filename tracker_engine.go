@@ -22,6 +22,15 @@ type TrackerConfig struct {
 	RecordEvents bool
 	FallbackFPS  float64
 	Settings     TrackingSettings
+	Nostr        NostrSettings
+}
+
+type NostrSettings struct {
+	Enabled          bool
+	RelayURL         string
+	SecretKey        string
+	MinTrackDistance float64
+	Timeout          time.Duration
 }
 
 // TrackerReady reports source properties once the input stream has opened.

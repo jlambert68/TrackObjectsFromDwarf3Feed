@@ -1,13 +1,23 @@
 package main
 
 import (
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
 	"math"
+	"math/big"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -15,6 +25,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"dwarf3-event-tracker/internal/nostrutil"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -24,6 +36,7 @@ import (
 	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+	"github.com/nbd-wtf/go-nostr"
 	"gocv.io/x/gocv"
 )
 
@@ -64,6 +77,11 @@ type trackerApp struct {
 	mog2HistoryEntry         *widget.Entry
 	mog2VarThresholdEntry    *widget.Entry
 	roiHeightEntry           *widget.Entry
+	nostrEnableCheck         *widget.Check
+	nostrRelayEntry          *widget.Entry
+	nostrSecretEntry         *widget.Entry
+	nostrMinDistanceEntry    *widget.Entry
+	nostrTestMessageEntry    *widget.Entry
 
 	fileButton               *widget.Button
 	outputButton             *widget.Button
@@ -91,6 +109,7 @@ type trackerApp struct {
 	showFinalPositionsButton *widget.Button
 	saveObjectNameButton     *widget.Button
 	playPauseButton          *widget.Button
+	sendNostrTestButton      *widget.Button
 
 	videoImage     *canvas.Image
 	maskImage      *canvas.Image
@@ -101,6 +120,7 @@ type trackerApp struct {
 
 	statusLabel                *widget.Label
 	eventLabel                 *widget.Label
+	mediaServerLabel           *widget.Label
 	dwarfStatusLabel           *widget.Label
 	dwarfQueueLabel            *widget.Label
 	playbackLabel              *widget.Label
@@ -143,6 +163,17 @@ type trackerApp struct {
 	updatingPlaybackUI      bool
 	updatingFinalPositionUI bool
 	activePlaybackOverlay   *playbackOverlay
+	pendingRunStatus        string
+	pendingRunError         error
+	projectRoot             string
+	mediaHTTPServer         *http.Server
+	mediaHTTPListener       net.Listener
+	mediaHTTPSServer        *http.Server
+	mediaHTTPSListener      net.Listener
+	mediaHTTPBaseURL        string
+	mediaServerBaseURL      string
+	mediaTLSCertPath        string
+	mediaTLSKeyPath         string
 }
 
 func (ui *trackerApp) showError(err error) {
@@ -156,6 +187,221 @@ func (ui *trackerApp) showError(err error) {
 func (ui *trackerApp) showInfo(title, message string) {
 	fmt.Fprintf(os.Stdout, "INFO [%s]: %s\n", title, message)
 	dialog.ShowInformation(title, message, ui.window)
+}
+
+func (ui *trackerApp) startMediaServer() error {
+	if ui.mediaHTTPServer != nil || ui.mediaHTTPSServer != nil {
+		return nil
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("/files/", http.StripPrefix("/files/", http.HandlerFunc(ui.serveProjectFile)))
+
+	var httpErr error
+	for port := mediaServerPortStart; port <= mediaServerPortEnd; port++ {
+		listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", mediaServerHost, port))
+		if err == nil {
+			ui.mediaHTTPListener = listener
+			ui.mediaHTTPBaseURL = fmt.Sprintf("http://%s:%d/files/", mediaServerPublicHost, port)
+			ui.mediaHTTPServer = &http.Server{Handler: mux}
+			break
+		}
+		httpErr = err
+	}
+	if ui.mediaHTTPListener == nil {
+		return fmt.Errorf("listen on %s:%d-%d: %w", mediaServerHost, mediaServerPortStart, mediaServerPortEnd, httpErr)
+	}
+
+	go func() {
+		if serveErr := ui.mediaHTTPServer.Serve(ui.mediaHTTPListener); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			fmt.Fprintf(os.Stderr, "media http server failed: %v\n", serveErr)
+			fyne.Do(func() {
+				ui.mediaServerLabel.SetText("Media HTTP: failed")
+			})
+		}
+	}()
+
+	if certErr := ui.ensureMediaTLSCertificate(); certErr == nil {
+		var httpsErr error
+		for port := mediaServerTLSPortStart; port <= mediaServerTLSPortEnd; port++ {
+			listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", mediaServerHost, port))
+			if err == nil {
+				cert, loadErr := tls.LoadX509KeyPair(ui.mediaTLSCertPath, ui.mediaTLSKeyPath)
+				if loadErr != nil {
+					_ = listener.Close()
+					return fmt.Errorf("load media tls certificate: %w", loadErr)
+				}
+				tlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
+				ui.mediaHTTPSListener = tls.NewListener(listener, tlsConfig)
+				ui.mediaHTTPSServer = &http.Server{Handler: mux}
+				ui.mediaServerBaseURL = fmt.Sprintf("https://%s:%d/files/", mediaServerPublicHost, port)
+				break
+			}
+			httpsErr = err
+		}
+		if ui.mediaHTTPSListener != nil {
+			go func() {
+				if serveErr := ui.mediaHTTPSServer.Serve(ui.mediaHTTPSListener); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+					fmt.Fprintf(os.Stderr, "media https server failed: %v\n", serveErr)
+					fyne.Do(func() {
+						ui.mediaServerLabel.SetText(fmt.Sprintf("Media HTTP: %s | HTTPS: failed", ui.mediaHTTPBaseURL))
+					})
+				}
+			}()
+			ui.mediaServerLabel.SetText(fmt.Sprintf("Media HTTP: %s | HTTPS: %s", ui.mediaHTTPBaseURL, ui.mediaServerBaseURL))
+		} else {
+			ui.mediaServerBaseURL = ui.mediaHTTPBaseURL
+			ui.mediaServerLabel.SetText(fmt.Sprintf("Media HTTP: %s | HTTPS unavailable: %v", ui.mediaHTTPBaseURL, httpsErr))
+		}
+	} else {
+		ui.mediaServerBaseURL = ui.mediaHTTPBaseURL
+		ui.mediaServerLabel.SetText(fmt.Sprintf("Media HTTP: %s | HTTPS unavailable: %v", ui.mediaHTTPBaseURL, certErr))
+	}
+
+	if ui.mediaServerBaseURL == "" {
+		ui.mediaServerBaseURL = ui.mediaHTTPBaseURL
+	}
+
+	return nil
+}
+
+func (ui *trackerApp) ensureMediaTLSCertificate() error {
+	if ui.projectRoot == "" {
+		return errors.New("missing project root")
+	}
+	certDir := filepath.Join(ui.projectRoot, ".media_tls")
+	if err := os.MkdirAll(certDir, 0o755); err != nil {
+		return fmt.Errorf("create tls directory: %w", err)
+	}
+	ui.mediaTLSCertPath = filepath.Join(certDir, "cert.pem")
+	ui.mediaTLSKeyPath = filepath.Join(certDir, "key.pem")
+	if _, certErr := os.Stat(ui.mediaTLSCertPath); certErr == nil {
+		if _, keyErr := os.Stat(ui.mediaTLSKeyPath); keyErr == nil {
+			return nil
+		}
+	}
+
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return fmt.Errorf("generate private key: %w", err)
+	}
+
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return fmt.Errorf("generate certificate serial: %w", err)
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: serial,
+		Subject: pkix.Name{
+			CommonName:   mediaServerPublicHost,
+			Organization: []string{"TrackObjectInDwarfLifvFeed_v1"},
+		},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{"localhost"},
+	}
+	if ip := net.ParseIP(mediaServerPublicHost); ip != nil {
+		template.IPAddresses = append(template.IPAddresses, ip)
+	}
+	if localhostIP := net.ParseIP("127.0.0.1"); localhostIP != nil {
+		template.IPAddresses = append(template.IPAddresses, localhostIP)
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, template, template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		return fmt.Errorf("create self-signed certificate: %w", err)
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)})
+	if err := os.WriteFile(ui.mediaTLSCertPath, certPEM, 0o644); err != nil {
+		return fmt.Errorf("write certificate: %w", err)
+	}
+	if err := os.WriteFile(ui.mediaTLSKeyPath, keyPEM, 0o600); err != nil {
+		return fmt.Errorf("write private key: %w", err)
+	}
+	return nil
+}
+
+func (ui *trackerApp) stopMediaServer() {
+	if ui.mediaHTTPServer != nil {
+		_ = ui.mediaHTTPServer.Close()
+		ui.mediaHTTPServer = nil
+		ui.mediaHTTPListener = nil
+	}
+	if ui.mediaHTTPSServer != nil {
+		_ = ui.mediaHTTPSServer.Close()
+		ui.mediaHTTPSServer = nil
+		ui.mediaHTTPSListener = nil
+	}
+}
+
+func (ui *trackerApp) serveProjectFile(w http.ResponseWriter, r *http.Request) {
+	requestPath := strings.TrimPrefix(r.URL.Path, "/")
+	cleanPath := filepath.Clean(requestPath)
+	if cleanPath == "." {
+		http.NotFound(w, r)
+		return
+	}
+
+	fullPath := filepath.Join(ui.projectRoot, cleanPath)
+	absRoot, err := filepath.Abs(ui.projectRoot)
+	if err != nil {
+		http.Error(w, "resolve project root", http.StatusInternalServerError)
+		return
+	}
+	absPath, err := filepath.Abs(fullPath)
+	if err != nil {
+		http.Error(w, "resolve file path", http.StatusBadRequest)
+		return
+	}
+	if absPath != absRoot && !strings.HasPrefix(absPath, absRoot+string(os.PathSeparator)) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	info, err := os.Stat(absPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			http.NotFound(w, r)
+			return
+		}
+		http.Error(w, "stat file", http.StatusInternalServerError)
+		return
+	}
+	if info.IsDir() {
+		http.NotFound(w, r)
+		return
+	}
+
+	http.ServeFile(w, r, absPath)
+}
+
+func (ui *trackerApp) projectFileURL(path string) string {
+	if ui.mediaServerBaseURL == "" || path == "" {
+		return ""
+	}
+	absRoot, err := filepath.Abs(ui.projectRoot)
+	if err != nil {
+		return ""
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return ""
+	}
+	relPath, err := filepath.Rel(absRoot, absPath)
+	if err != nil {
+		return ""
+	}
+	relPath = filepath.ToSlash(relPath)
+	if strings.HasPrefix(relPath, "../") || relPath == ".." {
+		return ""
+	}
+	return ui.mediaServerBaseURL + relPath
 }
 
 type eventHistoryEntry struct {
@@ -255,10 +501,17 @@ func (overlay *playbackOverlay) setFinalPositionMinDistance(value float64) {
 }
 
 const (
-	sortNewestFirst      = "Newest First"
-	sortHighestObjects   = "Highest Object Count"
-	sortHighestPeakSpeed = "Highest Peak Speed"
-	appID                = "com.jlambert.dwarf3-event-tracker"
+	sortNewestFirst         = "Newest First"
+	sortHighestObjects      = "Highest Object Count"
+	sortHighestPeakSpeed    = "Highest Peak Speed"
+	appID                   = "com.jlambert.dwarf3-event-tracker"
+	mediaServerHost         = "0.0.0.0"
+	mediaServerPublicHost   = "192.168.50.215"
+	mediaServerPortStart    = 8088
+	mediaServerPortEnd      = 8098
+	mediaServerTLSPortStart = 8443
+	mediaServerTLSPortEnd   = 8453
+	defaultNostrTestMessage = "test note\nhttps://cdn.grube.de/2024/10/24/square_icon_ch_100.png"
 
 	prefHistoryDateFilter   = "history.date_filter"
 	prefHistoryObjectFilter = "history.object_filter"
@@ -281,6 +534,11 @@ const (
 	prefTrackingROIHeight   = "tracking.roi_height_fraction"
 	prefTrackingPresets     = "tracking.presets"
 	prefTrackingPresetName  = "tracking.preset_name"
+	prefNostrEnabled        = "nostr.enabled"
+	prefNostrRelayURL       = "nostr.relay_url"
+	prefNostrSecretKey      = "nostr.secret_key"
+	prefNostrMinDistance    = "nostr.min_track_distance"
+	prefNostrTestMessage    = "nostr.test_message"
 )
 
 const (
@@ -322,10 +580,14 @@ func main() {
 	window.Resize(fyne.NewSize(1360, 860))
 
 	ui := newTrackerApp(window)
+	if err := ui.startMediaServer(); err != nil {
+		ui.showError(fmt.Errorf("start media server: %w", err))
+	}
 	window.SetContent(ui.buildUI())
 	window.SetCloseIntercept(func() {
 		ui.stopTracking()
 		ui.stopDwarfCapture()
+		ui.stopMediaServer()
 		window.Close()
 	})
 
@@ -333,6 +595,10 @@ func main() {
 }
 
 func newTrackerApp(window fyne.Window) *trackerApp {
+	projectRoot, err := os.Getwd()
+	if err != nil {
+		projectRoot = "."
+	}
 	sourceRadio := widget.NewRadioGroup([]string{"Live Stream", "Video File"}, nil)
 	sourceRadio.Horizontal = true
 	sourceRadio.SetSelected("Live Stream")
@@ -477,6 +743,16 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 	mog2VarThresholdEntry.SetText(formatFloat(defaults.MOG2VarThreshold))
 	roiHeightEntry := widget.NewEntry()
 	roiHeightEntry.SetText(formatFloat(defaults.TrackingROIHeightFrac))
+	nostrEnableCheck := widget.NewCheck("Publish Nostr note after video analysis", nil)
+	nostrRelayEntry := widget.NewEntry()
+	nostrRelayEntry.SetPlaceHolder("ws://127.0.0.1:7447")
+	nostrSecretEntry := widget.NewPasswordEntry()
+	nostrSecretEntry.SetPlaceHolder("nsec... or 64-char hex secret")
+	nostrMinDistanceEntry := widget.NewEntry()
+	nostrMinDistanceEntry.SetText("800")
+	nostrTestMessageEntry := widget.NewMultiLineEntry()
+	nostrTestMessageEntry.SetPlaceHolder("Write a Nostr test note")
+	nostrTestMessageEntry.Wrapping = fyne.TextWrapWord
 
 	ui := &trackerApp{
 		window:                     window,
@@ -514,6 +790,11 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 		mog2HistoryEntry:           mog2HistoryEntry,
 		mog2VarThresholdEntry:      mog2VarThresholdEntry,
 		roiHeightEntry:             roiHeightEntry,
+		nostrEnableCheck:           nostrEnableCheck,
+		nostrRelayEntry:            nostrRelayEntry,
+		nostrSecretEntry:           nostrSecretEntry,
+		nostrMinDistanceEntry:      nostrMinDistanceEntry,
+		nostrTestMessageEntry:      nostrTestMessageEntry,
 		videoImage:                 videoImage,
 		maskImage:                  maskImage,
 		objectImage:                objectImage,
@@ -523,6 +804,7 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 		eventLabel:                 widget.NewLabel("No event yet"),
 		dwarfStatusLabel:           widget.NewLabel("DWARF idle"),
 		dwarfQueueLabel:            widget.NewLabel("DWARF queue: 0"),
+		mediaServerLabel:           widget.NewLabel("Media HTTP: starting..."),
 		playbackLabel:              playbackLabel,
 		historyInfo:                historyInfo,
 		historyDetail:              historyDetail,
@@ -535,6 +817,7 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 		finalPositionSlider:        finalPositionSlider,
 		selectedHistory:            -1,
 		presets:                    make(map[string]TrackingSettings),
+		projectRoot:                projectRoot,
 		dwarfDownloadedFiles:       make(map[string]DwarfQueuedRecording),
 		playbackSeekFrame:          -1,
 		dwarfRawWSPayload:          "{\n  \"interface\": 10007,\n  \"camId\": 0,\n  \"name\": \"DWARF_TEST_MANUAL\"\n}",
@@ -571,6 +854,7 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 	ui.showFinalPositionsButton = widget.NewButtonWithIcon("Show Final Positions", theme.VisibilityIcon(), ui.watchFinalPositions)
 	ui.saveObjectNameButton = widget.NewButtonWithIcon("Save Name", theme.DocumentSaveIcon(), ui.saveSelectedObjectName)
 	ui.playPauseButton = widget.NewButtonWithIcon("Pause", theme.MediaPauseIcon(), ui.togglePlaybackPause)
+	ui.sendNostrTestButton = widget.NewButtonWithIcon("Send Test Note", theme.MailSendIcon(), ui.sendNostrTestNote)
 	ui.stopButton.Disable()
 	ui.stopDwarfButton.Disable()
 	ui.openTrackedButton.Disable()
@@ -734,6 +1018,18 @@ func (ui *trackerApp) buildUI() fyne.CanvasObject {
 		)),
 	)
 
+	nostrSettings := widget.NewAccordion(
+		widget.NewAccordionItem("Nostr Settings", container.NewVBox(
+			ui.nostrEnableCheck,
+			container.NewBorder(nil, nil, widget.NewLabel("Relay URL"), nil, ui.nostrRelayEntry),
+			container.NewBorder(nil, nil, widget.NewLabel("Secret Key"), nil, ui.nostrSecretEntry),
+			container.NewBorder(nil, nil, widget.NewLabel("Min Straight-Line Track Px"), nil, ui.nostrMinDistanceEntry),
+			widget.NewLabel("Test Note"),
+			ui.nostrTestMessageEntry,
+			container.NewHBox(ui.sendNostrTestButton),
+		)),
+	)
+
 	dwarfCapture := widget.NewAccordion(
 		widget.NewAccordionItem("Dwarf Capture", container.NewVBox(
 			dwarfHostRow,
@@ -759,11 +1055,13 @@ func (ui *trackerApp) buildUI() fyne.CanvasObject {
 		options,
 		dwarfCapture,
 		trackingSettings,
+		nostrSettings,
 		actions,
 	)
 
 	statusBar := container.NewVBox(
 		widget.NewSeparator(),
+		ui.mediaServerLabel,
 		ui.statusLabel,
 		ui.eventLabel,
 	)
@@ -1713,6 +2011,8 @@ func (ui *trackerApp) startTracking() {
 	ui.mu.Lock()
 	ui.running = true
 	ui.stopCh = stopCh
+	ui.pendingRunStatus = ""
+	ui.pendingRunError = nil
 	ui.mu.Unlock()
 
 	ui.startButton.Disable()
@@ -1913,6 +2213,10 @@ func (ui *trackerApp) buildConfig() (TrackerConfig, error) {
 	if err != nil {
 		return TrackerConfig{}, err
 	}
+	nostrSettings, err := ui.buildNostrSettings()
+	if err != nil {
+		return TrackerConfig{}, err
+	}
 
 	outputDir := ui.outputEntry.Text
 	if outputDir == "" {
@@ -1931,6 +2235,7 @@ func (ui *trackerApp) buildConfig() (TrackerConfig, error) {
 			RecordEvents: true,
 			FallbackFPS:  fallbackFPS,
 			Settings:     settings,
+			Nostr:        nostrSettings,
 		}, nil
 	}
 
@@ -1946,11 +2251,16 @@ func (ui *trackerApp) buildConfig() (TrackerConfig, error) {
 		RecordEvents: true,
 		FallbackFPS:  fallbackFPS,
 		Settings:     settings,
+		Nostr:        nostrSettings,
 	}, nil
 }
 
 func (ui *trackerApp) buildQueuedDwarfTrackerConfig(videoPath string) (TrackerConfig, error) {
 	settings, err := ui.buildTrackingSettings()
+	if err != nil {
+		return TrackerConfig{}, err
+	}
+	nostrSettings, err := ui.buildNostrSettings()
 	if err != nil {
 		return TrackerConfig{}, err
 	}
@@ -1968,6 +2278,7 @@ func (ui *trackerApp) buildQueuedDwarfTrackerConfig(videoPath string) (TrackerCo
 		RecordEvents: true,
 		FallbackFPS:  ui.parseFallbackFPS(),
 		Settings:     settings,
+		Nostr:        nostrSettings,
 	}, nil
 }
 
@@ -1987,6 +2298,7 @@ func (ui *trackerApp) runTracker(config TrackerConfig, stopCh chan struct{}) {
 }
 
 func (ui *trackerApp) executeTracker(config TrackerConfig, stopCh <-chan struct{}) error {
+	savedEventDirs := make([]string, 0, 4)
 	engine := TrackerEngine{
 		Config: config,
 		Stop:   stopCh,
@@ -2011,6 +2323,7 @@ func (ui *trackerApp) executeTracker(config TrackerConfig, stopCh <-chan struct{
 				return nil
 			},
 			OnEventSaved: func(dir string) error {
+				savedEventDirs = append(savedEventDirs, dir)
 				fyne.Do(func() {
 					ui.eventLabel.SetText("Saved: " + dir)
 					ui.refreshEventHistory()
@@ -2057,6 +2370,20 @@ func (ui *trackerApp) executeTracker(config TrackerConfig, stopCh <-chan struct{
 	}
 
 	err := engine.Run()
+	if err == nil && config.InputLabel == "video file" && config.Nostr.Enabled {
+		if publishErr := ui.publishCompletedVideoAnalysisNostrNote(savedEventDirs, config); publishErr != nil {
+			fmt.Fprintf(os.Stderr, "nostr publish failed for %s: %v\n", config.Input, publishErr)
+			ui.mu.Lock()
+			ui.pendingRunStatus = "Video analysis finished, but Nostr publish failed"
+			ui.pendingRunError = publishErr
+			ui.mu.Unlock()
+		} else {
+			ui.mu.Lock()
+			ui.pendingRunStatus = "Video analysis finished and published Nostr note"
+			ui.pendingRunError = nil
+			ui.mu.Unlock()
+		}
+	}
 	if err == nil && config.InputLabel == "video file" && NormalizeTrackingSettings(config.Settings).RawSegmentDuration > 0 && engine.RawSegmentDir != "" {
 		fyne.Do(func() {
 			ui.statusLabel.SetText("Processing raw segments in parallel...")
@@ -2340,6 +2667,10 @@ func (ui *trackerApp) finishRun(err error, idleText string) {
 	ui.running = false
 	ui.stopCh = nil
 	ui.activePlaybackOverlay = nil
+	pendingRunStatus := ui.pendingRunStatus
+	pendingRunError := ui.pendingRunError
+	ui.pendingRunStatus = ""
+	ui.pendingRunError = nil
 	ui.mu.Unlock()
 
 	ui.startButton.Enable()
@@ -2348,7 +2679,14 @@ func (ui *trackerApp) finishRun(err error, idleText string) {
 
 	switch {
 	case err == nil || errors.Is(err, ErrStopTracking):
-		ui.statusLabel.SetText(idleText)
+		if pendingRunStatus != "" {
+			ui.statusLabel.SetText(pendingRunStatus)
+			if pendingRunError != nil {
+				ui.showError(pendingRunError)
+			}
+		} else {
+			ui.statusLabel.SetText(idleText)
+		}
 	default:
 		ui.statusLabel.SetText("Stopped with error")
 		ui.showError(err)
@@ -2666,6 +3004,15 @@ func (ui *trackerApp) loadTrackingPreferences() {
 	ui.mog2HistoryEntry.SetText(prefs.StringWithFallback(prefTrackingMOG2History, strconv.Itoa(defaults.MOG2History)))
 	ui.mog2VarThresholdEntry.SetText(prefs.StringWithFallback(prefTrackingMOG2Var, formatFloat(defaults.MOG2VarThreshold)))
 	ui.roiHeightEntry.SetText(prefs.StringWithFallback(prefTrackingROIHeight, formatFloat(defaults.TrackingROIHeightFrac)))
+	ui.nostrEnableCheck.SetChecked(prefs.BoolWithFallback(prefNostrEnabled, false))
+	ui.nostrRelayEntry.SetText(prefs.StringWithFallback(prefNostrRelayURL, nostrutil.DefaultRelayURL))
+	ui.nostrSecretEntry.SetText(prefs.StringWithFallback(prefNostrSecretKey, ""))
+	ui.nostrMinDistanceEntry.SetText(prefs.StringWithFallback(prefNostrMinDistance, "800"))
+	nostrTestMessage := prefs.StringWithFallback(prefNostrTestMessage, "")
+	if nostrTestMessage == "" || nostrTestMessage == "Nostr integration test" {
+		nostrTestMessage = defaultNostrTestMessage
+	}
+	ui.nostrTestMessageEntry.SetText(nostrTestMessage)
 }
 
 func (ui *trackerApp) saveTrackingPreferences() {
@@ -2685,6 +3032,11 @@ func (ui *trackerApp) saveTrackingPreferences() {
 	prefs.SetString(prefTrackingMOG2History, ui.mog2HistoryEntry.Text)
 	prefs.SetString(prefTrackingMOG2Var, ui.mog2VarThresholdEntry.Text)
 	prefs.SetString(prefTrackingROIHeight, ui.roiHeightEntry.Text)
+	prefs.SetBool(prefNostrEnabled, ui.nostrEnableCheck.Checked)
+	prefs.SetString(prefNostrRelayURL, ui.nostrRelayEntry.Text)
+	prefs.SetString(prefNostrSecretKey, ui.nostrSecretEntry.Text)
+	prefs.SetString(prefNostrMinDistance, ui.nostrMinDistanceEntry.Text)
+	prefs.SetString(prefNostrTestMessage, ui.nostrTestMessageEntry.Text)
 }
 
 func (ui *trackerApp) loadTrackingPresets() {
@@ -2842,6 +3194,92 @@ func (ui *trackerApp) buildTrackingSettings() (TrackingSettings, error) {
 
 	ui.saveTrackingPreferences()
 	return settings, nil
+}
+
+func (ui *trackerApp) buildNostrSettings() (NostrSettings, error) {
+	settings := NostrSettings{
+		Enabled:   ui.nostrEnableCheck.Checked,
+		RelayURL:  strings.TrimSpace(ui.nostrRelayEntry.Text),
+		SecretKey: strings.TrimSpace(ui.nostrSecretEntry.Text),
+		Timeout:   nostrutil.DefaultTimeout,
+	}
+
+	minDistanceText := strings.TrimSpace(ui.nostrMinDistanceEntry.Text)
+	if minDistanceText == "" {
+		minDistanceText = "0"
+	}
+	minDistance, err := strconv.ParseFloat(minDistanceText, 64)
+	if err != nil {
+		return NostrSettings{}, errors.New("Nostr min straight-line track distance must be a number")
+	}
+	if minDistance < 0 {
+		return NostrSettings{}, errors.New("Nostr min straight-line track distance must be 0 or greater")
+	}
+	settings.MinTrackDistance = minDistance
+
+	if err := validateNostrSettings(settings, settings.Enabled); err != nil {
+		return NostrSettings{}, err
+	}
+
+	return settings, nil
+}
+
+func validateNostrSettings(settings NostrSettings, requirePublishConfig bool) error {
+	if !requirePublishConfig {
+		return nil
+	}
+	if settings.RelayURL == "" {
+		return errors.New("Nostr relay URL is required")
+	}
+	if settings.SecretKey == "" {
+		return errors.New("Nostr secret key is required")
+	}
+	if _, err := nostrutil.ResolveSecretKey(settings.SecretKey); err != nil {
+		return fmt.Errorf("invalid Nostr secret key: %w", err)
+	}
+	return nil
+}
+
+func (ui *trackerApp) sendNostrTestNote() {
+	settings, err := ui.buildNostrSettings()
+	if err != nil {
+		ui.showError(err)
+		return
+	}
+	if err := validateNostrSettings(settings, true); err != nil {
+		ui.showError(err)
+		return
+	}
+
+	content := strings.TrimSpace(ui.nostrTestMessageEntry.Text)
+	if content == "" {
+		ui.showError(errors.New("Nostr test note content is required"))
+		return
+	}
+
+	ui.saveTrackingPreferences()
+	ui.sendNostrTestButton.Disable()
+	ui.statusLabel.SetText("Sending Nostr test note...")
+
+	go func() {
+		eventID, publishErr := nostrutil.PublishTextNote(context.Background(), nostrutil.PublishOptions{
+			RelayURL:  settings.RelayURL,
+			SecretKey: settings.SecretKey,
+			Timeout:   settings.Timeout,
+			Content:   content,
+		})
+
+		fyne.Do(func() {
+			ui.sendNostrTestButton.Enable()
+			if publishErr != nil {
+				ui.statusLabel.SetText("Nostr test note failed")
+				ui.showError(publishErr)
+				return
+			}
+			ui.statusLabel.SetText("Nostr test note sent")
+			ui.showInfo("Nostr Test Note Sent", fmt.Sprintf("Published event ID:\n%s", eventID))
+		})
+	}()
 }
 
 func (ui *trackerApp) saveTrackingPreset() {
@@ -3418,6 +3856,206 @@ func loadEventHistory(root string) ([]eventHistoryEntry, error) {
 	})
 
 	return entries, nil
+}
+
+func loadEventSummaryFromDir(dir string) EventSummary {
+	summary := EventSummary{
+		EventID: dir,
+	}
+
+	eventJSON := filepath.Join(dir, "event.json")
+	if data, err := os.ReadFile(eventJSON); err == nil {
+		_ = json.Unmarshal(data, &summary)
+	}
+	summary.TrackingSettings = NormalizeTrackingSettings(summary.TrackingSettings)
+	if summary.OriginalVideo == "" {
+		summary.OriginalVideo = "original.avi"
+	}
+	if summary.TrackedVideo == "" {
+		summary.TrackedVideo = "tracked.avi"
+	}
+	if summary.MaskedVideo == "" {
+		summary.MaskedVideo = "masked.avi"
+	}
+	if summary.TrackCropsDir == "" {
+		summary.TrackCropsDir = "track_crops"
+	}
+	if summary.TrackNamesFile == "" {
+		summary.TrackNamesFile = "track_names.json"
+	}
+	if summary.TrackingMetadata == "" {
+		summary.TrackingMetadata = "tracking.json"
+	}
+	if summary.EventID == "" {
+		summary.EventID = filepath.Base(dir)
+	}
+	return summary
+}
+
+func (ui *trackerApp) publishVideoAnalysisNostrNote(dir string, config TrackerConfig) error {
+	detail, err := loadEventDetail(eventHistoryEntry{
+		Directory: dir,
+		Summary:   loadEventSummaryFromDir(dir),
+	})
+	if err != nil {
+		return fmt.Errorf("load event detail: %w", err)
+	}
+
+	content := ui.formatNostrEventSummary(detail, config)
+	_, err = nostrutil.PublishTextNote(context.Background(), nostrutil.PublishOptions{
+		RelayURL:  config.Nostr.RelayURL,
+		SecretKey: config.Nostr.SecretKey,
+		Timeout:   config.Nostr.Timeout,
+		Content:   content,
+		Tags:      ui.nostrImageTags(detail, config),
+	})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (ui *trackerApp) publishCompletedVideoAnalysisNostrNote(eventDirs []string, config TrackerConfig) error {
+	completionContent := fmt.Sprintf("Finished processing video file: %s", filepath.Base(config.Input))
+	if _, err := nostrutil.PublishTextNote(context.Background(), nostrutil.PublishOptions{
+		RelayURL:  config.Nostr.RelayURL,
+		SecretKey: config.Nostr.SecretKey,
+		Timeout:   config.Nostr.Timeout,
+		Content:   completionContent,
+	}); err != nil {
+		return err
+	}
+
+	if len(eventDirs) == 0 {
+		content := fmt.Sprintf(
+			"Video analysis complete: %s | no recorded events found | 0 objects >= %.0f px straight-line travel",
+			filepath.Base(config.Input),
+			config.Nostr.MinTrackDistance,
+		)
+		_, err := nostrutil.PublishTextNote(context.Background(), nostrutil.PublishOptions{
+			RelayURL:  config.Nostr.RelayURL,
+			SecretKey: config.Nostr.SecretKey,
+			Timeout:   config.Nostr.Timeout,
+			Content:   content,
+		})
+		return err
+	}
+
+	if len(eventDirs) == 1 {
+		return ui.publishVideoAnalysisNostrNote(eventDirs[0], config)
+	}
+
+	lines := []string{
+		fmt.Sprintf(
+			"Video analysis complete: %s | %d recorded events | objects listed when >= %.0f px straight-line travel",
+			filepath.Base(config.Input),
+			len(eventDirs),
+			config.Nostr.MinTrackDistance,
+		),
+	}
+	tags := make(nostr.Tags, 0)
+
+	for i, dir := range eventDirs {
+		detail, err := loadEventDetail(eventHistoryEntry{
+			Directory: dir,
+			Summary:   loadEventSummaryFromDir(dir),
+		})
+		if err != nil {
+			return fmt.Errorf("load event detail %s: %w", dir, err)
+		}
+
+		lines = append(lines, "")
+		lines = append(lines, fmt.Sprintf("Event %d", i+1))
+		lines = append(lines, ui.formatNostrEventSummary(detail, config))
+		tags = append(tags, ui.nostrImageTags(detail, config)...)
+	}
+
+	_, err := nostrutil.PublishTextNote(context.Background(), nostrutil.PublishOptions{
+		RelayURL:  config.Nostr.RelayURL,
+		SecretKey: config.Nostr.SecretKey,
+		Timeout:   config.Nostr.Timeout,
+		Content:   strings.Join(lines, "\n"),
+		Tags:      dedupeNostrTags(tags),
+	})
+	return err
+}
+
+func (ui *trackerApp) formatNostrEventSummary(detail eventHistoryDetail, config TrackerConfig) string {
+	qualified := make([]trackedObjectDetail, 0, len(detail.Objects))
+	for _, object := range detail.Objects {
+		if object.TravelDistance >= config.Nostr.MinTrackDistance {
+			qualified = append(qualified, object)
+		}
+	}
+	sort.Slice(qualified, func(i, j int) bool {
+		if qualified[i].TravelDistance == qualified[j].TravelDistance {
+			return qualified[i].ID < qualified[j].ID
+		}
+		return qualified[i].TravelDistance > qualified[j].TravelDistance
+	})
+
+	eventTime := detail.Summary.StartedAt
+	if eventTime.IsZero() {
+		eventTime = time.Now()
+	}
+
+	objectLines := make([]string, 0, len(qualified))
+	for _, object := range qualified {
+		lineParts := []string{fmt.Sprintf("#%04d", object.ID)}
+		if cropURL := ui.projectFileURL(representativeObjectCropPath(object)); cropURL != "" {
+			lineParts = append(lineParts, cropURL)
+		}
+		objectLines = append(objectLines, strings.Join(lineParts, "\n"))
+	}
+	if len(objectLines) == 0 {
+		objectLines = append(objectLines, "none")
+	}
+
+	return strings.Join([]string{
+		fmt.Sprintf("File: %s", filepath.Base(config.Input)),
+		fmt.Sprintf("Datetime: %s", eventTime.Local().Format("2006-01-02 15:04:05")),
+		fmt.Sprintf("Objects:\n%s", strings.Join(objectLines, "\n")),
+	}, "\n")
+}
+
+func (ui *trackerApp) nostrImageTags(detail eventHistoryDetail, config TrackerConfig) nostr.Tags {
+	qualified := make([]trackedObjectDetail, 0, len(detail.Objects))
+	for _, object := range detail.Objects {
+		if object.TravelDistance >= config.Nostr.MinTrackDistance {
+			qualified = append(qualified, object)
+		}
+	}
+	sort.Slice(qualified, func(i, j int) bool {
+		if qualified[i].TravelDistance == qualified[j].TravelDistance {
+			return qualified[i].ID < qualified[j].ID
+		}
+		return qualified[i].TravelDistance > qualified[j].TravelDistance
+	})
+
+	tags := make(nostr.Tags, 0, len(qualified))
+	for _, object := range qualified {
+		if cropURL := ui.projectFileURL(representativeObjectCropPath(object)); cropURL != "" {
+			tags = append(tags, nostr.Tag{"r", cropURL})
+		}
+	}
+	return tags
+}
+
+func dedupeNostrTags(tags nostr.Tags) nostr.Tags {
+	if len(tags) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(tags))
+	result := make(nostr.Tags, 0, len(tags))
+	for _, tag := range tags {
+		key := strings.Join(tag, "\x00")
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, tag)
+	}
+	return result
 }
 
 func loadEventDetail(entry eventHistoryEntry) (eventHistoryDetail, error) {
