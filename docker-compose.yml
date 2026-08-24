@@ -1,0 +1,17 @@
+services:
+  nostr-relay:
+    image: ghcr.io/mattn/nostr-relay:latest
+    container_name: nostr-relay
+    restart: unless-stopped
+    ports:
+      - "7447:7447"
+    environment:
+      DATABASE_URL: /data/nostr-relay.sqlite
+      LOG_LEVEL: info
+      # SERVICE_URL: wss://your-domain.example
+      # NOSTR_RELAY_NAME: my relay
+      # NOSTR_RELAY_DESCRIPTION: personal relay
+      # NOSTR_RELAY_CONTACT: admin@example.com
+      # NOSTR_RELAY_PUBKEY: npub1...
+    volumes:
+      - ./data:/data
