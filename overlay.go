@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"math"
 
 	"gocv.io/x/gocv"
 )
@@ -59,6 +60,86 @@ func drawMetadataOverlay(frame *gocv.Mat, tracks []TrackMetadata, settings Track
 
 		drawTargetAndLabel(frame, t.ID, center, t.VX, t.VY, t.Speed, trackColor, arrowColor)
 	}
+}
+
+func drawSelectedReplayOverlay(frame *gocv.Mat, track TrackMetadata, object *trackedObjectDetail, settings TrackingSettings) {
+	settings = NormalizeTrackingSettings(settings)
+	drawTrackingROI(frame, settings)
+
+	trackColor, arrowColor := overlayColors(track.Type)
+	center := image.Pt(track.X, track.Y)
+	rect := scaleRectAroundCenter(
+		image.Rect(track.BoxX, track.BoxY, track.BoxX+track.BoxWidth, track.BoxY+track.BoxHeight),
+		trackBoxScale,
+	)
+
+	gocv.Rectangle(frame, rect, trackColor, 3)
+
+	trail := make([]image.Point, 0, len(track.Trail))
+	for _, point := range track.Trail {
+		trail = append(trail, image.Pt(point.X, point.Y))
+	}
+	for i := 1; i < len(trail); i++ {
+		gocv.Line(frame, trail[i-1], trail[i], trackColor, 2)
+	}
+
+	gocv.Circle(frame, center, trackCircleRadius+6, trackColor, 3)
+	gocv.Line(frame, image.Pt(center.X-trackCrosshairArm-8, center.Y), image.Pt(center.X+trackCrosshairArm+8, center.Y), trackColor, 2)
+	gocv.Line(frame, image.Pt(center.X, center.Y-trackCrosshairArm-8), image.Pt(center.X, center.Y+trackCrosshairArm+8), trackColor, 2)
+
+	label := fmt.Sprintf("#%d  %.0f px/s", track.ID, track.Speed)
+	if object != nil && object.Name != "" {
+		label = fmt.Sprintf("%s  #%d  %.0f px/s", object.Name, track.ID, track.Speed)
+	}
+	gocv.PutText(frame, label, overlayLabelPoint(frame, center, label, 1.0, 3),
+		gocv.FontHersheySimplex, 1.0, trackColor, 3)
+	gocv.Line(frame, center, image.Pt(center.X+int(track.VX*0.20), center.Y+int(track.VY*0.20)), arrowColor, 3)
+}
+
+func drawFinalPositionOverlay(frame *gocv.Mat, objects []trackedObjectDetail, minDistance float64) {
+	for _, object := range objects {
+		if object.TravelDistance < minDistance {
+			continue
+		}
+
+		trackColor, arrowColor := overlayColors(object.PrimaryType)
+		first := image.Pt(object.FirstPositionX, object.FirstPositionY)
+		last := image.Pt(object.LastPositionX, object.LastPositionY)
+
+		for i := 1; i < len(object.Path); i++ {
+			gocv.Line(frame, object.Path[i-1], object.Path[i], arrowColor, 2)
+		}
+		gocv.Circle(frame, first, 8, trackColor, 2)
+		gocv.Circle(frame, last, trackCircleRadius+4, trackColor, 3)
+		gocv.Line(frame, image.Pt(last.X-trackCrosshairArm, last.Y), image.Pt(last.X+trackCrosshairArm, last.Y), trackColor, 2)
+		gocv.Line(frame, image.Pt(last.X, last.Y-trackCrosshairArm), image.Pt(last.X, last.Y+trackCrosshairArm), trackColor, 2)
+
+		label := fmt.Sprintf("#%d  %.0f px", object.ID, object.TravelDistance)
+		gocv.PutText(frame, label, overlayLabelPoint(frame, last, label, 1.0, 3),
+			gocv.FontHersheySimplex, 1.0, trackColor, 3)
+	}
+}
+
+func drawSelectedObjectPathOverlay(frame *gocv.Mat, object trackedObjectDetail) {
+	trackColor, arrowColor := overlayColors(object.PrimaryType)
+	first := image.Pt(object.FirstPositionX, object.FirstPositionY)
+	last := image.Pt(object.LastPositionX, object.LastPositionY)
+
+	for i := 1; i < len(object.Path); i++ {
+		gocv.Line(frame, object.Path[i-1], object.Path[i], arrowColor, 2)
+	}
+
+	gocv.Circle(frame, first, 8, trackColor, 2)
+	gocv.Circle(frame, last, trackCircleRadius+4, trackColor, 3)
+	label := fmt.Sprintf("#%d  path  %.0f px", object.ID, object.TravelDistance)
+	gocv.PutText(frame, label, overlayLabelPoint(frame, last, label, 1.0, 3),
+		gocv.FontHersheySimplex, 1.0, trackColor, 3)
+}
+
+func drawTrackInCropOverlay(frame *gocv.Mat, track TrackMetadata, rect image.Rectangle, center image.Point) {
+	trackColor, arrowColor := overlayColors(track.Type)
+	gocv.Rectangle(frame, rect, trackColor, 2)
+	drawTargetAndLabel(frame, track.ID, center, track.VX, track.VY, track.Speed, trackColor, arrowColor)
 }
 
 func filterTrackMetadataByID(tracks []TrackMetadata, id int) []TrackMetadata {
@@ -130,6 +211,38 @@ func drawTargetAndLabel(
 	gocv.Line(frame, center, end, arrowColor, 2)
 
 	label := fmt.Sprintf("#%d  %.0f px/s", id, speed)
-	gocv.PutText(frame, label, image.Pt(center.X+12, center.Y-12),
-		gocv.FontHersheySimplex, 0.45, trackColor, 1)
+	gocv.PutText(frame, label, overlayLabelPoint(frame, center, label, 1.2, 3),
+		gocv.FontHersheySimplex, 1.2, trackColor, 3)
+}
+
+func overlayLabelPoint(frame *gocv.Mat, anchor image.Point, label string, scale float64, thickness int) image.Point {
+	const (
+		rightOffset = 18
+		leftOffset  = 18
+		yOffset     = 18
+		margin      = 8
+	)
+
+	size := gocv.GetTextSize(label, gocv.FontHersheySimplex, scale, thickness)
+
+	x := anchor.X + rightOffset
+	if x+size.X+margin > frame.Cols() {
+		x = anchor.X - leftOffset - size.X
+	}
+	x = overlayMaxInt(margin, overlayMinInt(x, frame.Cols()-size.X-margin))
+
+	y := anchor.Y - yOffset
+	minBaselineY := size.Y + margin
+	maxBaselineY := frame.Rows() - margin
+	y = overlayMaxInt(minBaselineY, overlayMinInt(y, maxBaselineY))
+
+	return image.Pt(x, y)
+}
+
+func overlayMinInt(a, b int) int {
+	return int(math.Min(float64(a), float64(b)))
+}
+
+func overlayMaxInt(a, b int) int {
+	return int(math.Max(float64(a), float64(b)))
 }

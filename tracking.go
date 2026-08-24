@@ -12,7 +12,7 @@ func maxMissedFramesForSettings(settings TrackingSettings) int {
 	if settings.Profile == trackingProfileBall {
 		return 12
 	}
-	return 2
+	return 1
 }
 
 // findDetections converts the cleaned foreground mask into bounding boxes and
@@ -33,6 +33,13 @@ func findDetections(mask gocv.Mat, settings TrackingSettings) []Detection {
 
 		rect := gocv.BoundingRect(contour)
 		if rect.Dx() < 2 || rect.Dy() < 2 {
+			continue
+		}
+		rectArea := float64(rect.Dx() * rect.Dy())
+		if rectArea <= 0 {
+			continue
+		}
+		if area/rectArea < minDetectionFillRatioForSettings(settings) {
 			continue
 		}
 
@@ -383,6 +390,18 @@ func makeTrailMetadata(points []image.Point) []TrailPoint {
 }
 
 func classifyTrack(t *Track, settings TrackingSettings) (string, bool) {
+	if t == nil {
+		return "", false
+	}
+	if t.Hits < minConfirmedHitsForClassification(settings) {
+		return "", false
+	}
+	if len(t.Trail) < minTrackTrailPointsForSettings(settings) {
+		return "", false
+	}
+	if trackNetDisplacement(t.Trail) < minTrackNetDisplacementForSettings(settings) {
+		return "", false
+	}
 	if t.Speed >= settings.MinSpeed {
 		return trackTypeFast, true
 	}
@@ -390,6 +409,49 @@ func classifyTrack(t *Track, settings TrackingSettings) (string, bool) {
 		return trackTypeSlow, true
 	}
 	return "", false
+}
+
+func minDetectionFillRatioForSettings(settings TrackingSettings) float64 {
+	if settings.Profile == trackingProfileBall {
+		return 0.10
+	}
+	return 0.20
+}
+
+func minConfirmedHitsForClassification(settings TrackingSettings) int {
+	if settings.Profile == trackingProfileBall {
+		if settings.MinHits > 2 {
+			return settings.MinHits
+		}
+		return 2
+	}
+	if settings.MinHits > 3 {
+		return settings.MinHits
+	}
+	return 3
+}
+
+func minTrackTrailPointsForSettings(settings TrackingSettings) int {
+	if settings.Profile == trackingProfileBall {
+		return 2
+	}
+	return 3
+}
+
+func minTrackNetDisplacementForSettings(settings TrackingSettings) float64 {
+	if settings.Profile == trackingProfileBall {
+		return 4.0
+	}
+	return 10.0
+}
+
+func trackNetDisplacement(points []image.Point) float64 {
+	if len(points) < 2 {
+		return 0
+	}
+	first := points[0]
+	last := points[len(points)-1]
+	return math.Hypot(float64(last.X-first.X), float64(last.Y-first.Y))
 }
 
 func hasFreshInterestingTracks(tracks []*Track, settings TrackingSettings) bool {

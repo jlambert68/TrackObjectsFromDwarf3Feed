@@ -65,31 +65,32 @@ type trackerApp struct {
 	mog2VarThresholdEntry    *widget.Entry
 	roiHeightEntry           *widget.Entry
 
-	fileButton            *widget.Button
-	outputButton          *widget.Button
-	dwarfDownloadButton   *widget.Button
-	startButton           *widget.Button
-	stopButton            *widget.Button
-	startDwarfButton      *widget.Button
-	stopDwarfButton       *widget.Button
-	fetchDwarfButton      *widget.Button
-	testDwarfButton       *widget.Button
-	testDwarfRecordButton *widget.Button
-	rawDwarfWSButton      *widget.Button
-	sessionProbeButton    *widget.Button
-	resetTrackingButton   *widget.Button
-	importTrackingButton  *widget.Button
-	exportTrackingButton  *widget.Button
-	savePresetButton      *widget.Button
-	applyPresetButton     *widget.Button
-	deletePresetButton    *widget.Button
-	refreshButton         *widget.Button
-	openTrackedButton     *widget.Button
-	openOriginalButton    *widget.Button
-	restoreSettingsButton *widget.Button
-	watchObjectButton     *widget.Button
-	saveObjectNameButton  *widget.Button
-	playPauseButton       *widget.Button
+	fileButton               *widget.Button
+	outputButton             *widget.Button
+	dwarfDownloadButton      *widget.Button
+	startButton              *widget.Button
+	stopButton               *widget.Button
+	startDwarfButton         *widget.Button
+	stopDwarfButton          *widget.Button
+	fetchDwarfButton         *widget.Button
+	testDwarfButton          *widget.Button
+	testDwarfRecordButton    *widget.Button
+	rawDwarfWSButton         *widget.Button
+	sessionProbeButton       *widget.Button
+	resetTrackingButton      *widget.Button
+	importTrackingButton     *widget.Button
+	exportTrackingButton     *widget.Button
+	savePresetButton         *widget.Button
+	applyPresetButton        *widget.Button
+	deletePresetButton       *widget.Button
+	refreshButton            *widget.Button
+	openTrackedButton        *widget.Button
+	openOriginalButton       *widget.Button
+	restoreSettingsButton    *widget.Button
+	watchObjectButton        *widget.Button
+	showFinalPositionsButton *widget.Button
+	saveObjectNameButton     *widget.Button
+	playPauseButton          *widget.Button
 
 	videoImage     *canvas.Image
 	maskImage      *canvas.Image
@@ -98,44 +99,50 @@ type trackerApp struct {
 	tabs           *container.AppTabs
 	playbackSlider *widget.Slider
 
-	statusLabel        *widget.Label
-	eventLabel         *widget.Label
-	dwarfStatusLabel   *widget.Label
-	dwarfQueueLabel    *widget.Label
-	playbackLabel      *widget.Label
-	historyList        *widget.List
-	historyInfo        *widget.Label
-	historyDetail      *widget.Entry
-	objectList         *widget.List
-	objectName         *widget.Entry
-	objectDetail       *widget.Entry
-	objectMapSkipEntry *widget.Entry
+	statusLabel                *widget.Label
+	eventLabel                 *widget.Label
+	dwarfStatusLabel           *widget.Label
+	dwarfQueueLabel            *widget.Label
+	playbackLabel              *widget.Label
+	historyList                *widget.List
+	historyInfo                *widget.Label
+	historyDetail              *widget.Entry
+	objectList                 *widget.List
+	objectSearchEntry          *widget.Entry
+	objectName                 *widget.Entry
+	objectDetail               *widget.Entry
+	objectMapSkipEntry         *widget.Entry
+	finalPositionDistanceEntry *widget.Entry
+	finalPositionSlider        *widget.Slider
 
 	dwarfRawWSPayload        string
 	dwarfSessionProbePayload string
 
 	allHistoryEntries []eventHistoryEntry
 	historyEntries    []eventHistoryEntry
+	filteredObjectIDs []int
 	selectedHistory   int
 	selectedObjectID  int
 	currentDetail     *eventHistoryDetail
 	presets           map[string]TrackingSettings
 
-	mu                   sync.Mutex
-	running              bool
-	stopCh               chan struct{}
-	dwarfCaptureRunning  bool
-	dwarfCaptureStopCh   chan struct{}
-	dwarfQueuedFiles     []DwarfQueuedRecording
-	dwarfDownloadedFiles map[string]DwarfQueuedRecording
-	dwarfQueueProcessing bool
-	playbackActive       bool
-	playbackPaused       bool
-	playbackSeekFrame    int
-	playbackCurrentFrame int
-	playbackTotalFrames  int
-	playbackFPS          float64
-	updatingPlaybackUI   bool
+	mu                      sync.Mutex
+	running                 bool
+	stopCh                  chan struct{}
+	dwarfCaptureRunning     bool
+	dwarfCaptureStopCh      chan struct{}
+	dwarfQueuedFiles        []DwarfQueuedRecording
+	dwarfDownloadedFiles    map[string]DwarfQueuedRecording
+	dwarfQueueProcessing    bool
+	playbackActive          bool
+	playbackPaused          bool
+	playbackSeekFrame       int
+	playbackCurrentFrame    int
+	playbackTotalFrames     int
+	playbackFPS             float64
+	updatingPlaybackUI      bool
+	updatingFinalPositionUI bool
+	activePlaybackOverlay   *playbackOverlay
 }
 
 func (ui *trackerApp) showError(err error) {
@@ -176,8 +183,12 @@ type trackedObjectDetail struct {
 	Name           string
 	PrimaryType    string
 	FramesSeen     int
+	FirstSeenFrame int
+	LastSeenFrame  int
 	FirstSeenMS    int64
 	LastSeenMS     int64
+	TravelDistance float64
+	Path           []image.Point
 	MaxSpeed       float64
 	AverageWidth   float64
 	AverageHeight  float64
@@ -200,13 +211,47 @@ type dwarfDownloadRequest struct {
 }
 
 type playbackOverlay struct {
-	Tracking           EventMetadata
-	Settings           TrackingSettings
-	SelectedTrackID    int
-	Label              string
-	CropBySourceFrame  map[int]string
-	CropSourceFrames   []int
-	ObjectMapSkipCount int
+	Tracking                 EventMetadata
+	Settings                 TrackingSettings
+	SelectedTrackID          int
+	SelectedObject           *trackedObjectDetail
+	StartFrame               int
+	Label                    string
+	CropBySourceFrame        map[int]string
+	CropSourceFrames         []int
+	ObjectMapSkipCount       int
+	ShowFrameTracks          bool
+	ShowFinalPositions       bool
+	FinalPositionObjects     []trackedObjectDetail
+	FinalPositionMinDistance float64
+	mu                       sync.RWMutex
+}
+
+func (overlay *playbackOverlay) frameTracksEnabled() bool {
+	if overlay == nil {
+		return false
+	}
+	overlay.mu.RLock()
+	defer overlay.mu.RUnlock()
+	return overlay.ShowFrameTracks
+}
+
+func (overlay *playbackOverlay) finalPositionConfig() (bool, float64, []trackedObjectDetail) {
+	if overlay == nil {
+		return false, 0, nil
+	}
+	overlay.mu.RLock()
+	defer overlay.mu.RUnlock()
+	return overlay.ShowFinalPositions, overlay.FinalPositionMinDistance, overlay.FinalPositionObjects
+}
+
+func (overlay *playbackOverlay) setFinalPositionMinDistance(value float64) {
+	if overlay == nil {
+		return
+	}
+	overlay.mu.Lock()
+	overlay.FinalPositionMinDistance = value
+	overlay.mu.Unlock()
 }
 
 const (
@@ -388,13 +433,19 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 		},
 		func(widget.ListItemID, fyne.CanvasObject) {},
 	)
+	objectSearchEntry := widget.NewEntry()
+	objectSearchEntry.SetPlaceHolder("Filter by object ID")
 	objectName := widget.NewEntry()
 	objectName.SetPlaceHolder("Object name")
 	objectDetail := widget.NewMultiLineEntry()
 	objectDetail.SetText("Select an event, then select an object to inspect its metadata.")
-	objectDetail.Disable()
 	objectMapSkipEntry := widget.NewEntry()
 	objectMapSkipEntry.SetText("0")
+	finalPositionDistanceEntry := widget.NewEntry()
+	finalPositionDistanceEntry.SetText("0")
+	finalPositionSlider := widget.NewSlider(0, 1)
+	finalPositionSlider.Step = 1
+	finalPositionSlider.Disable()
 
 	minAreaEntry := widget.NewEntry()
 	minAreaEntry.SetText(formatFloat(defaults.MinArea))
@@ -428,63 +479,66 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 	roiHeightEntry.SetText(formatFloat(defaults.TrackingROIHeightFrac))
 
 	ui := &trackerApp{
-		window:                   window,
-		sourceRadio:              sourceRadio,
-		urlEntry:                 urlEntry,
-		fileEntry:                fileEntry,
-		outputEntry:              outputEntry,
-		fpsEntry:                 fpsEntry,
-		dwarfHostEntry:           dwarfHostEntry,
-		dwarfCameraSelect:        dwarfCameraSelect,
-		dwarfSegmentEntry:        dwarfSegmentEntry,
-		dwarfDownloadDirEntry:    dwarfDownloadDirEntry,
-		dwarfDeleteCheck:         dwarfDeleteCheck,
-		dwarfDebugWSCheck:        dwarfDebugWSCheck,
-		showMask:                 showMask,
-		dateFilter:               dateFilter,
-		objectFilter:             objectFilter,
-		speedFilter:              speedFilter,
-		sortSelect:               sortSelect,
-		presetSelect:             presetSelect,
-		profileSelect:            profileSelect,
-		presetNameEntry:          presetNameEntry,
-		minAreaEntry:             minAreaEntry,
-		maxAreaEntry:             maxAreaEntry,
-		slowSpeedEntry:           slowSpeedEntry,
-		minSpeedEntry:            minSpeedEntry,
-		matchDistanceEntry:       matchDistanceEntry,
-		minHitsEntry:             minHitsEntry,
-		blurSizeEntry:            blurSizeEntry,
-		foregroundThresholdEntry: foregroundThresholdEntry,
-		preEventEntry:            preEventEntry,
-		postEventEntry:           postEventEntry,
-		rawSegmentEntry:          rawSegmentEntry,
-		rawSegmentOverlapEntry:   rawSegmentOverlapEntry,
-		mog2HistoryEntry:         mog2HistoryEntry,
-		mog2VarThresholdEntry:    mog2VarThresholdEntry,
-		roiHeightEntry:           roiHeightEntry,
-		videoImage:               videoImage,
-		maskImage:                maskImage,
-		objectImage:              objectImage,
-		objectMapImage:           objectMapImage,
-		playbackSlider:           playbackSlider,
-		statusLabel:              widget.NewLabel("Idle"),
-		eventLabel:               widget.NewLabel("No event yet"),
-		dwarfStatusLabel:         widget.NewLabel("DWARF idle"),
-		dwarfQueueLabel:          widget.NewLabel("DWARF queue: 0"),
-		playbackLabel:            playbackLabel,
-		historyInfo:              historyInfo,
-		historyDetail:            historyDetail,
-		objectList:               objectList,
-		objectName:               objectName,
-		objectDetail:             objectDetail,
-		objectMapSkipEntry:       objectMapSkipEntry,
-		selectedHistory:          -1,
-		presets:                  make(map[string]TrackingSettings),
-		dwarfDownloadedFiles:     make(map[string]DwarfQueuedRecording),
-		playbackSeekFrame:        -1,
-		dwarfRawWSPayload:        "{\n  \"interface\": 10007,\n  \"camId\": 0,\n  \"name\": \"DWARF_TEST_MANUAL\"\n}",
-		dwarfSessionProbePayload: "{\n  \"clientId\": \"DAF3\",\n  \"type\": \"ping\"\n}",
+		window:                     window,
+		sourceRadio:                sourceRadio,
+		urlEntry:                   urlEntry,
+		fileEntry:                  fileEntry,
+		outputEntry:                outputEntry,
+		fpsEntry:                   fpsEntry,
+		dwarfHostEntry:             dwarfHostEntry,
+		dwarfCameraSelect:          dwarfCameraSelect,
+		dwarfSegmentEntry:          dwarfSegmentEntry,
+		dwarfDownloadDirEntry:      dwarfDownloadDirEntry,
+		dwarfDeleteCheck:           dwarfDeleteCheck,
+		dwarfDebugWSCheck:          dwarfDebugWSCheck,
+		showMask:                   showMask,
+		dateFilter:                 dateFilter,
+		objectFilter:               objectFilter,
+		speedFilter:                speedFilter,
+		sortSelect:                 sortSelect,
+		presetSelect:               presetSelect,
+		profileSelect:              profileSelect,
+		presetNameEntry:            presetNameEntry,
+		minAreaEntry:               minAreaEntry,
+		maxAreaEntry:               maxAreaEntry,
+		slowSpeedEntry:             slowSpeedEntry,
+		minSpeedEntry:              minSpeedEntry,
+		matchDistanceEntry:         matchDistanceEntry,
+		minHitsEntry:               minHitsEntry,
+		blurSizeEntry:              blurSizeEntry,
+		foregroundThresholdEntry:   foregroundThresholdEntry,
+		preEventEntry:              preEventEntry,
+		postEventEntry:             postEventEntry,
+		rawSegmentEntry:            rawSegmentEntry,
+		rawSegmentOverlapEntry:     rawSegmentOverlapEntry,
+		mog2HistoryEntry:           mog2HistoryEntry,
+		mog2VarThresholdEntry:      mog2VarThresholdEntry,
+		roiHeightEntry:             roiHeightEntry,
+		videoImage:                 videoImage,
+		maskImage:                  maskImage,
+		objectImage:                objectImage,
+		objectMapImage:             objectMapImage,
+		playbackSlider:             playbackSlider,
+		statusLabel:                widget.NewLabel("Idle"),
+		eventLabel:                 widget.NewLabel("No event yet"),
+		dwarfStatusLabel:           widget.NewLabel("DWARF idle"),
+		dwarfQueueLabel:            widget.NewLabel("DWARF queue: 0"),
+		playbackLabel:              playbackLabel,
+		historyInfo:                historyInfo,
+		historyDetail:              historyDetail,
+		objectList:                 objectList,
+		objectSearchEntry:          objectSearchEntry,
+		objectName:                 objectName,
+		objectDetail:               objectDetail,
+		objectMapSkipEntry:         objectMapSkipEntry,
+		finalPositionDistanceEntry: finalPositionDistanceEntry,
+		finalPositionSlider:        finalPositionSlider,
+		selectedHistory:            -1,
+		presets:                    make(map[string]TrackingSettings),
+		dwarfDownloadedFiles:       make(map[string]DwarfQueuedRecording),
+		playbackSeekFrame:          -1,
+		dwarfRawWSPayload:          "{\n  \"interface\": 10007,\n  \"camId\": 0,\n  \"name\": \"DWARF_TEST_MANUAL\"\n}",
+		dwarfSessionProbePayload:   "{\n  \"clientId\": \"DAF3\",\n  \"type\": \"ping\"\n}",
 	}
 
 	ui.fileButton = widget.NewButtonWithIcon("", theme.FolderOpenIcon(), ui.pickVideoFile)
@@ -514,6 +568,7 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 	})
 	ui.restoreSettingsButton = widget.NewButtonWithIcon("Restore Settings", theme.ViewRefreshIcon(), ui.restoreSettingsFromSelectedEvent)
 	ui.watchObjectButton = widget.NewButtonWithIcon("Watch Object", theme.MediaPlayIcon(), ui.watchSelectedObject)
+	ui.showFinalPositionsButton = widget.NewButtonWithIcon("Show Final Positions", theme.VisibilityIcon(), ui.watchFinalPositions)
 	ui.saveObjectNameButton = widget.NewButtonWithIcon("Save Name", theme.DocumentSaveIcon(), ui.saveSelectedObjectName)
 	ui.playPauseButton = widget.NewButtonWithIcon("Pause", theme.MediaPauseIcon(), ui.togglePlaybackPause)
 	ui.stopButton.Disable()
@@ -522,10 +577,13 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 	ui.openOriginalButton.Disable()
 	ui.restoreSettingsButton.Disable()
 	ui.watchObjectButton.Disable()
+	ui.showFinalPositionsButton.Disable()
 	ui.saveObjectNameButton.Disable()
 	ui.applyPresetButton.Disable()
 	ui.deletePresetButton.Disable()
 	ui.playPauseButton.Disable()
+	ui.finalPositionSlider.Disable()
+	ui.finalPositionDistanceEntry.Disable()
 
 	ui.sourceRadio.OnChanged = func(string) {
 		ui.refreshSourceControls()
@@ -578,16 +636,13 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 		ui.updateHistorySelection()
 	}
 	ui.objectList.Length = func() int {
-		if ui.currentDetail == nil {
-			return 0
-		}
-		return len(ui.currentDetail.Objects)
+		return len(ui.filteredObjectIDs)
 	}
 	ui.objectList.UpdateItem = func(id widget.ListItemID, obj fyne.CanvasObject) {
-		if ui.currentDetail == nil || id < 0 || id >= len(ui.currentDetail.Objects) {
+		object, ok := ui.filteredObjectAt(id)
+		if !ok {
 			return
 		}
-		object := ui.currentDetail.Objects[id]
 		row := obj.(*fyne.Container)
 		thumb := row.Objects[0].(*canvas.Image)
 		info := row.Objects[1].(*fyne.Container)
@@ -596,13 +651,14 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 		thumb.Image = loadObjectListPreview(object)
 		thumb.Refresh()
 		title.SetText(formatObjectOption(object))
-		subtitle.SetText(fmt.Sprintf("%.0f px/s   %d frames", object.MaxSpeed, object.FramesSeen))
+		subtitle.SetText(fmt.Sprintf("%.0f px/s   %.0f px travel   %d frames", object.MaxSpeed, object.TravelDistance, object.FramesSeen))
 	}
 	ui.objectList.OnSelected = func(id widget.ListItemID) {
-		if ui.currentDetail == nil || id < 0 || id >= len(ui.currentDetail.Objects) {
+		object, ok := ui.filteredObjectAt(id)
+		if !ok {
 			return
 		}
-		ui.selectedObjectID = ui.currentDetail.Objects[id].ID
+		ui.selectedObjectID = object.ID
 		ui.updateSelectedObject()
 	}
 	ui.playbackSlider.OnChanged = func(value float64) {
@@ -610,6 +666,15 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 	}
 	ui.playbackSlider.OnChangeEnded = func(value float64) {
 		ui.handlePlaybackSliderChanged(value)
+	}
+	ui.finalPositionSlider.OnChanged = func(value float64) {
+		ui.handleFinalPositionSliderChanged(value)
+	}
+	ui.finalPositionDistanceEntry.OnChanged = func(value string) {
+		ui.handleFinalPositionDistanceEntryChanged(value)
+	}
+	ui.objectSearchEntry.OnChanged = func(string) {
+		ui.applyObjectListFilter()
 	}
 
 	ui.loadTrackingPreferences()
@@ -736,9 +801,15 @@ func (ui *trackerApp) buildUI() fyne.CanvasObject {
 	historyActions := container.NewHBox(ui.openTrackedButton, ui.openOriginalButton, ui.restoreSettingsButton)
 	objectActions := container.NewHBox(
 		ui.watchObjectButton,
+		ui.showFinalPositionsButton,
 		widget.NewLabel("Skip"),
 		ui.objectMapSkipEntry,
 		ui.saveObjectNameButton,
+	)
+	finalPositionControls := container.NewVBox(
+		widget.NewLabelWithStyle("Final Position Filter", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		container.NewBorder(nil, nil, widget.NewLabel("Min Travel"), nil, ui.finalPositionSlider),
+		container.NewBorder(nil, nil, widget.NewLabel("Min Travel Px"), nil, ui.finalPositionDistanceEntry),
 	)
 	filterRow := container.NewGridWithColumns(1,
 		container.NewBorder(nil, nil, widget.NewLabel("Date"), nil, ui.dateFilter),
@@ -757,9 +828,11 @@ func (ui *trackerApp) buildUI() fyne.CanvasObject {
 	)
 	objectInfoPanel := container.NewVBox(
 		widget.NewLabelWithStyle("Tracked Object", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		container.NewBorder(nil, nil, widget.NewLabel("Find Object ID"), nil, ui.objectSearchEntry),
 		ui.objectList,
 		container.NewBorder(nil, nil, widget.NewLabel("Name"), nil, ui.objectName),
 		objectActions,
+		finalPositionControls,
 		ui.objectDetail,
 	)
 	objectPanel := container.NewHSplit(objectInfoPanel, container.NewPadded(objectPreviewPanel))
@@ -2057,10 +2130,25 @@ func (ui *trackerApp) runPlayback(path, label, maskPath string, stopCh chan stru
 	var lastObjectImage image.Image
 	objectMapSeen := 0
 	frameIndex := 0
+	if overlay != nil && overlay.StartFrame > 0 {
+		frameIndex = overlay.StartFrame
+	}
 	placeholder := newPlaceholderFrame()
+	if overlay != nil && overlay.SelectedObject != nil {
+		lastObjectImage = loadObjectListPreview(*overlay.SelectedObject)
+	}
+	if frameIndex > 0 {
+		capture.Set(gocv.VideoCapturePosFrames, float64(frameIndex))
+		if maskCapture != nil {
+			maskCapture.Set(gocv.VideoCapturePosFrames, float64(frameIndex))
+		}
+	}
 
 	fyne.Do(func() {
 		ui.startPlaybackControls(totalFrames, fps)
+		if frameIndex > 0 {
+			ui.updatePlaybackFrame(frameIndex, fps)
+		}
 		ui.statusLabel.SetText(fmt.Sprintf("Playing %s at %.3f FPS", label, fps))
 		ui.eventLabel.SetText(path)
 		ui.tabs.SelectIndex(0)
@@ -2117,11 +2205,21 @@ func (ui *trackerApp) runPlayback(path, label, maskPath string, stopCh chan stru
 		if overlay != nil && frameIndex < len(overlay.Tracking.Frames) {
 			overlayFrame = frame.Clone()
 			hasOverlayFrame = true
-			tracks := overlay.Tracking.Frames[frameIndex].Tracks
-			if overlay.SelectedTrackID > 0 {
-				tracks = filterTrackMetadataByID(tracks, overlay.SelectedTrackID)
+			frameMeta := overlay.Tracking.Frames[frameIndex]
+			frameTracks := frameMeta.Tracks
+			if overlay.frameTracksEnabled() {
+				if overlay.SelectedTrackID > 0 {
+					if selectedTrack, ok := selectedTrackInFrame(frameMeta, overlay.SelectedTrackID); ok {
+						drawSelectedReplayOverlay(&overlayFrame, selectedTrack, overlay.SelectedObject, overlay.Settings)
+					}
+				} else {
+					drawMetadataOverlay(&overlayFrame, frameTracks, overlay.Settings)
+				}
 			}
-			drawMetadataOverlay(&overlayFrame, tracks, overlay.Settings)
+			showFinalPositions, minDistance, objects := overlay.finalPositionConfig()
+			if showFinalPositions {
+				drawFinalPositionOverlay(&overlayFrame, objects, minDistance)
+			}
 			displayMat = overlayFrame
 		}
 
@@ -2207,7 +2305,15 @@ func (ui *trackerApp) runPlayback(path, label, maskPath string, stopCh chan stru
 			}
 			ui.objectImage.Refresh()
 			if objectMapCanvas != nil {
-				ui.objectMapImage.Image = objectMapCanvas
+				if overlay != nil && overlay.SelectedObject != nil {
+					if rendered := renderObjectMapImage(objectMapCanvas, *overlay.SelectedObject); rendered != nil {
+						ui.objectMapImage.Image = rendered
+					} else {
+						ui.objectMapImage.Image = objectMapCanvas
+					}
+				} else {
+					ui.objectMapImage.Image = objectMapCanvas
+				}
 			} else {
 				ui.objectMapImage.Image = placeholder
 			}
@@ -2233,6 +2339,7 @@ func (ui *trackerApp) finishRun(err error, idleText string) {
 	ui.mu.Lock()
 	ui.running = false
 	ui.stopCh = nil
+	ui.activePlaybackOverlay = nil
 	ui.mu.Unlock()
 
 	ui.startButton.Enable()
@@ -2346,9 +2453,10 @@ func (ui *trackerApp) openSelectedEventVideo(tracked bool) {
 		label = "tracked"
 		if _, err := os.Stat(filepath.Join(entry.Directory, filename)); err != nil && detail.HasTracking && detail.Tracking != nil {
 			overlay = &playbackOverlay{
-				Tracking: *detail.Tracking,
-				Settings: NormalizeTrackingSettings(detail.Summary.TrackingSettings),
-				Label:    label,
+				Tracking:        *detail.Tracking,
+				Settings:        NormalizeTrackingSettings(detail.Summary.TrackingSettings),
+				Label:           label,
+				ShowFrameTracks: true,
 			}
 			filename = "original.avi"
 			label = "tracked (reconstructed)"
@@ -2374,6 +2482,7 @@ func (ui *trackerApp) openSelectedEventVideo(tracked bool) {
 	ui.mu.Lock()
 	ui.running = true
 	ui.stopCh = stopCh
+	ui.activePlaybackOverlay = overlay
 	ui.mu.Unlock()
 
 	ui.startButton.Disable()
@@ -2845,6 +2954,7 @@ func (ui *trackerApp) resetImages() {
 
 func (ui *trackerApp) resetObjectSelection(message string) {
 	ui.selectedObjectID = 0
+	ui.filteredObjectIDs = nil
 	ui.objectList.UnselectAll()
 	ui.objectList.Refresh()
 	ui.objectName.SetText("")
@@ -2853,17 +2963,18 @@ func (ui *trackerApp) resetObjectSelection(message string) {
 	ui.objectImage.Image = newPlaceholderFrame()
 	ui.objectImage.Refresh()
 	ui.watchObjectButton.Disable()
+	ui.showFinalPositionsButton.Disable()
 	ui.saveObjectNameButton.Disable()
+	ui.configureFinalPositionControls(nil)
 }
 
 func (ui *trackerApp) populateObjectSelection(detail eventHistoryDetail) {
-	ui.objectList.Refresh()
+	ui.configureFinalPositionControls(&detail)
 	if len(detail.Objects) == 0 {
 		ui.resetObjectSelection("No persisted tracked objects were found for this event.")
 		return
 	}
-	ui.selectedObjectID = detail.Objects[0].ID
-	ui.objectList.Select(0)
+	ui.applyObjectListFilter()
 }
 
 func (ui *trackerApp) updateSelectedObject() {
@@ -2895,7 +3006,97 @@ func (ui *trackerApp) updateSelectedObject() {
 		ui.objectImage.Refresh()
 	}
 	ui.watchObjectButton.Enable()
+	if ui.currentDetail != nil && ui.currentDetail.HasTracking && len(ui.currentDetail.Objects) > 0 {
+		ui.showFinalPositionsButton.Enable()
+	}
 	ui.saveObjectNameButton.Enable()
+}
+
+func (ui *trackerApp) configureFinalPositionControls(detail *eventHistoryDetail) {
+	maxDistance := 1.0
+	enabled := false
+	if detail != nil && detail.HasTracking && len(detail.Objects) > 0 {
+		maxDistance = math.Max(1, math.Ceil(maxTravelDistance(detail.Objects)))
+		enabled = true
+	}
+
+	currentThreshold := 0.0
+	if ui.finalPositionDistanceEntry != nil && ui.finalPositionDistanceEntry.Text != "" {
+		if parsed, err := strconv.ParseFloat(ui.finalPositionDistanceEntry.Text, 64); err == nil {
+			currentThreshold = parsed
+		}
+	}
+	currentThreshold = clampFloat(currentThreshold, 0, maxDistance)
+
+	ui.updatingFinalPositionUI = true
+	ui.finalPositionSlider.Min = 0
+	ui.finalPositionSlider.Max = maxDistance
+	ui.finalPositionSlider.Step = 1
+	ui.finalPositionSlider.SetValue(currentThreshold)
+	ui.finalPositionDistanceEntry.SetText(formatFloat(currentThreshold))
+	ui.updatingFinalPositionUI = false
+
+	if enabled {
+		ui.finalPositionSlider.Enable()
+		ui.finalPositionDistanceEntry.Enable()
+	} else {
+		ui.finalPositionSlider.Disable()
+		ui.finalPositionDistanceEntry.Disable()
+	}
+}
+
+func (ui *trackerApp) handleFinalPositionSliderChanged(value float64) {
+	if ui.updatingFinalPositionUI {
+		return
+	}
+	ui.applyFinalPositionThreshold(value, true)
+}
+
+func (ui *trackerApp) handleFinalPositionDistanceEntryChanged(value string) {
+	if ui.updatingFinalPositionUI || value == "" {
+		return
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return
+	}
+	ui.applyFinalPositionThreshold(parsed, false)
+}
+
+func (ui *trackerApp) applyFinalPositionThreshold(value float64, updateEntry bool) {
+	maxDistance := math.Max(1, ui.finalPositionSlider.Max)
+	value = clampFloat(value, 0, maxDistance)
+
+	ui.updatingFinalPositionUI = true
+	if math.Abs(ui.finalPositionSlider.Value-value) > 0.0001 {
+		ui.finalPositionSlider.SetValue(value)
+	}
+	if updateEntry || ui.finalPositionDistanceEntry.Text == "" {
+		ui.finalPositionDistanceEntry.SetText(formatFloat(value))
+	} else if parsed, err := strconv.ParseFloat(ui.finalPositionDistanceEntry.Text, 64); err == nil && math.Abs(parsed-value) > 0.0001 {
+		ui.finalPositionDistanceEntry.SetText(formatFloat(value))
+	}
+	ui.updatingFinalPositionUI = false
+
+	ui.mu.Lock()
+	activeOverlay := ui.activePlaybackOverlay
+	ui.mu.Unlock()
+	if activeOverlay != nil {
+		showFinalPositions, _, _ := activeOverlay.finalPositionConfig()
+		if showFinalPositions {
+			activeOverlay.setFinalPositionMinDistance(value)
+			ui.refreshActivePlaybackFrame()
+		}
+	}
+}
+
+func (ui *trackerApp) refreshActivePlaybackFrame() {
+	ui.mu.Lock()
+	defer ui.mu.Unlock()
+	if !ui.playbackActive || ui.activePlaybackOverlay == nil {
+		return
+	}
+	ui.playbackSeekFrame = ui.playbackCurrentFrame
 }
 
 func (ui *trackerApp) selectedObject() (trackedObjectDetail, bool) {
@@ -2908,6 +3109,69 @@ func (ui *trackerApp) selectedObject() (trackedObjectDetail, bool) {
 		}
 	}
 	return trackedObjectDetail{}, false
+}
+
+func (ui *trackerApp) filteredObjectAt(id widget.ListItemID) (trackedObjectDetail, bool) {
+	if ui.currentDetail == nil || id < 0 || id >= len(ui.filteredObjectIDs) {
+		return trackedObjectDetail{}, false
+	}
+	objectIndex := ui.filteredObjectIDs[id]
+	if objectIndex < 0 || objectIndex >= len(ui.currentDetail.Objects) {
+		return trackedObjectDetail{}, false
+	}
+	return ui.currentDetail.Objects[objectIndex], true
+}
+
+func (ui *trackerApp) applyObjectListFilter() {
+	if ui.currentDetail == nil {
+		ui.resetObjectSelection("Select an event, then select an object to inspect its metadata.")
+		return
+	}
+
+	filter := strings.TrimSpace(ui.objectSearchEntry.Text)
+	ui.filteredObjectIDs = ui.filteredObjectIDs[:0]
+	for i, object := range ui.currentDetail.Objects {
+		if filter == "" || strings.Contains(strconv.Itoa(object.ID), filter) {
+			ui.filteredObjectIDs = append(ui.filteredObjectIDs, i)
+		}
+	}
+
+	ui.objectList.UnselectAll()
+	ui.objectList.Refresh()
+	ui.showFinalPositionsButton.Disable()
+	if ui.currentDetail.HasTracking && len(ui.currentDetail.Objects) > 0 {
+		ui.showFinalPositionsButton.Enable()
+	}
+
+	if len(ui.filteredObjectIDs) == 0 {
+		ui.selectedObjectID = 0
+		ui.objectName.SetText("")
+		ui.objectName.Disable()
+		ui.objectDetail.SetText("No tracked objects match the object ID filter.")
+		ui.objectImage.Image = newPlaceholderFrame()
+		ui.objectImage.Refresh()
+		ui.watchObjectButton.Disable()
+		ui.saveObjectNameButton.Disable()
+		return
+	}
+
+	selectedVisible := false
+	for _, objectIndex := range ui.filteredObjectIDs {
+		if ui.currentDetail.Objects[objectIndex].ID == ui.selectedObjectID {
+			selectedVisible = true
+			break
+		}
+	}
+	if !selectedVisible {
+		ui.selectedObjectID = ui.currentDetail.Objects[ui.filteredObjectIDs[0]].ID
+	}
+
+	for visibleIndex, objectIndex := range ui.filteredObjectIDs {
+		if ui.currentDetail.Objects[objectIndex].ID == ui.selectedObjectID {
+			ui.objectList.Select(visibleIndex)
+			return
+		}
+	}
 }
 
 func (ui *trackerApp) watchSelectedObject() {
@@ -2953,20 +3217,25 @@ func (ui *trackerApp) watchSelectedObject() {
 	}
 
 	cropBySourceFrame, cropSourceFrames := makeCropBySourceFrame(object.CropPaths)
+	selectedObject := object
 	overlay := &playbackOverlay{
 		Tracking:           *ui.currentDetail.Tracking,
 		Settings:           NormalizeTrackingSettings(ui.currentDetail.Summary.TrackingSettings),
 		SelectedTrackID:    object.ID,
+		SelectedObject:     &selectedObject,
+		StartFrame:         max(0, object.FirstSeenFrame-1),
 		Label:              formatObjectOption(object),
 		CropBySourceFrame:  cropBySourceFrame,
 		CropSourceFrames:   cropSourceFrames,
 		ObjectMapSkipCount: objectMapSkipCount,
+		ShowFrameTracks:    true,
 	}
 
 	stopCh := make(chan struct{})
 	ui.mu.Lock()
 	ui.running = true
 	ui.stopCh = stopCh
+	ui.activePlaybackOverlay = overlay
 	ui.mu.Unlock()
 
 	ui.startButton.Disable()
@@ -2976,6 +3245,73 @@ func (ui *trackerApp) watchSelectedObject() {
 	ui.resetImages()
 
 	go ui.runPlayback(videoPath, formatObjectOption(object), maskPath, stopCh, overlay)
+}
+
+func (ui *trackerApp) watchFinalPositions() {
+	ui.mu.Lock()
+	running := ui.running
+	ui.mu.Unlock()
+	if running {
+		ui.showInfo("Busy", "Stop the current tracker or playback first.")
+		return
+	}
+
+	if ui.currentDetail == nil || ui.currentDetail.Tracking == nil || !ui.currentDetail.HasTracking {
+		ui.showInfo("No Tracking Metadata", "No saved tracking metadata was found for the selected event.")
+		return
+	}
+	if len(ui.currentDetail.Objects) == 0 {
+		ui.showInfo("No Objects", "No tracked objects were found for the selected event.")
+		return
+	}
+
+	minDistance, err := parseRequiredFloat(ui.finalPositionDistanceEntry.Text, "Min Travel Px")
+	if err != nil {
+		ui.showError(err)
+		return
+	}
+	minDistance = clampFloat(minDistance, 0, math.Max(1, ui.finalPositionSlider.Max))
+	ui.applyFinalPositionThreshold(minDistance, true)
+
+	entry := ui.historyEntries[ui.selectedHistory]
+	videoPath := filepath.Join(entry.Directory, ui.currentDetail.Summary.OriginalVideo)
+	if ui.currentDetail.Summary.OriginalVideo == "" {
+		videoPath = filepath.Join(entry.Directory, "original.avi")
+	}
+	if _, err := os.Stat(videoPath); err != nil {
+		ui.showError(fmt.Errorf("open original video: %w", err))
+		return
+	}
+
+	maskPath := filepath.Join(entry.Directory, ui.currentDetail.Summary.MaskedVideo)
+	if ui.currentDetail.Summary.MaskedVideo == "" {
+		maskPath = filepath.Join(entry.Directory, "masked.avi")
+	}
+
+	overlay := &playbackOverlay{
+		Tracking:                 *ui.currentDetail.Tracking,
+		Settings:                 NormalizeTrackingSettings(ui.currentDetail.Summary.TrackingSettings),
+		Label:                    "Final positions",
+		ShowFrameTracks:          false,
+		ShowFinalPositions:       true,
+		FinalPositionObjects:     append([]trackedObjectDetail(nil), ui.currentDetail.Objects...),
+		FinalPositionMinDistance: minDistance,
+	}
+
+	stopCh := make(chan struct{})
+	ui.mu.Lock()
+	ui.running = true
+	ui.stopCh = stopCh
+	ui.activePlaybackOverlay = overlay
+	ui.mu.Unlock()
+
+	ui.startButton.Disable()
+	ui.stopButton.Enable()
+	ui.statusLabel.SetText("Starting final-position replay...")
+	ui.eventLabel.SetText(videoPath)
+	ui.resetImages()
+
+	go ui.runPlayback(videoPath, "Final positions", maskPath, stopCh, overlay)
 }
 
 func (ui *trackerApp) saveSelectedObjectName() {
@@ -3155,9 +3491,12 @@ func loadEventDetail(entry eventHistoryEntry) (eventHistoryDetail, error) {
 					ID:             track.ID,
 					Name:           trackNames[track.ID],
 					PrimaryType:    track.Type,
+					FirstSeenFrame: frame.SourceFrame,
+					LastSeenFrame:  frame.SourceFrame,
 					FirstSeenMS:    frame.TimeMS,
 					LastSeenMS:     frame.TimeMS,
 					MaxSpeed:       track.Speed,
+					Path:           make([]image.Point, 0, 32),
 					FirstPositionX: track.X,
 					FirstPositionY: track.Y,
 					LastPositionX:  track.X,
@@ -3167,9 +3506,11 @@ func loadEventDetail(entry eventHistoryEntry) (eventHistoryDetail, error) {
 			}
 
 			object.FramesSeen++
+			object.LastSeenFrame = frame.SourceFrame
 			object.LastSeenMS = frame.TimeMS
 			object.LastPositionX = track.X
 			object.LastPositionY = track.Y
+			object.Path = append(object.Path, image.Pt(track.X, track.Y))
 			object.AverageWidth += float64(track.BoxWidth)
 			object.AverageHeight += float64(track.BoxHeight)
 			if track.Speed > object.MaxSpeed {
@@ -3193,6 +3534,10 @@ func loadEventDetail(entry eventHistoryEntry) (eventHistoryDetail, error) {
 			object.FirstCropPath = crops[0]
 			object.LastCropPath = crops[len(crops)-1]
 		}
+		object.TravelDistance = math.Hypot(
+			float64(object.LastPositionX-object.FirstPositionX),
+			float64(object.LastPositionY-object.FirstPositionY),
+		)
 		if object.FramesSeen > 0 {
 			object.AverageWidth /= float64(object.FramesSeen)
 			object.AverageHeight /= float64(object.FramesSeen)
@@ -3305,6 +3650,13 @@ func lookupObjectCropPath(overlay *playbackOverlay, sourceFrame int) string {
 	for i := len(overlay.CropSourceFrames) - 1; i >= 0; i-- {
 		frame := overlay.CropSourceFrames[i]
 		if frame > sourceFrame {
+			continue
+		}
+		return overlay.CropBySourceFrame[frame]
+	}
+	for i := 0; i < len(overlay.CropSourceFrames); i++ {
+		frame := overlay.CropSourceFrames[i]
+		if frame < sourceFrame {
 			continue
 		}
 		return overlay.CropBySourceFrame[frame]
@@ -3486,9 +3838,9 @@ func formatEventDetail(detail eventHistoryDetail, dir string) string {
 
 func formatObjectOption(object trackedObjectDetail) string {
 	if object.Name != "" {
-		return fmt.Sprintf("#%04d  %s", object.ID, object.Name)
+		return fmt.Sprintf("#%04d  %s  (last frame %d)", object.ID, object.Name, object.LastSeenFrame)
 	}
-	return fmt.Sprintf("#%04d", object.ID)
+	return fmt.Sprintf("#%04d  (last frame %d)", object.ID, object.LastSeenFrame)
 }
 
 func formatObjectDetail(object trackedObjectDetail) string {
@@ -3497,8 +3849,11 @@ func formatObjectDetail(object trackedObjectDetail) string {
 		fmt.Sprintf("Name: %s", fallbackString(object.Name, "n/a")),
 		fmt.Sprintf("Type: %s", fallbackString(object.PrimaryType, "n/a")),
 		fmt.Sprintf("Frames seen: %d", object.FramesSeen),
+		fmt.Sprintf("First seen frame: %d", object.FirstSeenFrame),
+		fmt.Sprintf("Last seen frame: %d", object.LastSeenFrame),
 		fmt.Sprintf("First seen: %s", formatDurationMS(object.FirstSeenMS)),
 		fmt.Sprintf("Last seen: %s", formatDurationMS(object.LastSeenMS)),
+		fmt.Sprintf("Travel distance: %.2f px", object.TravelDistance),
 		fmt.Sprintf("Peak speed: %.2f px/s", object.MaxSpeed),
 		fmt.Sprintf("Average box: %.1fx%.1f px", object.AverageWidth, object.AverageHeight),
 		fmt.Sprintf("First position: (%d, %d)", object.FirstPositionX, object.FirstPositionY),
@@ -3533,6 +3888,26 @@ func formatDurationMS(ms int64) string {
 
 func formatFloat(value float64) string {
 	return strconv.FormatFloat(value, 'f', -1, 64)
+}
+
+func clampFloat(value, minValue, maxValue float64) float64 {
+	if value < minValue {
+		return minValue
+	}
+	if value > maxValue {
+		return maxValue
+	}
+	return value
+}
+
+func maxTravelDistance(objects []trackedObjectDetail) float64 {
+	maxDistance := 0.0
+	for _, object := range objects {
+		if object.TravelDistance > maxDistance {
+			maxDistance = object.TravelDistance
+		}
+	}
+	return maxDistance
 }
 
 func parseRequiredFloat(value, label string) (float64, error) {
@@ -3647,4 +4022,23 @@ func cloneImage(src image.Image) image.Image {
 	dst := image.NewRGBA(bounds)
 	draw.Draw(dst, bounds, src, bounds.Min, draw.Src)
 	return dst
+}
+
+func renderObjectMapImage(canvas *image.RGBA, object trackedObjectDetail) image.Image {
+	if canvas == nil {
+		return nil
+	}
+
+	mat, err := gocv.ImageToMatRGBA(cloneImage(canvas))
+	if err != nil {
+		return nil
+	}
+	defer mat.Close()
+
+	drawSelectedObjectPathOverlay(&mat, object)
+	rendered, err := mat.ToImage()
+	if err != nil {
+		return nil
+	}
+	return cloneImage(rendered)
 }

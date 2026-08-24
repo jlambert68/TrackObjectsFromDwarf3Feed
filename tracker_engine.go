@@ -417,19 +417,19 @@ func buildFrameUpdate(
 	status := fmt.Sprintf("FAST: %d   SLOW: %d   detections: %d   tracks: %d",
 		fastCount, slowCount, detectionCount, len(tracks))
 	gocv.PutText(&display, status, image.Pt(20, 30),
-		gocv.FontHersheySimplex, 0.65, textColor, 2)
+		gocv.FontHersheySimplex, 0.9, textColor, 2)
 
 	if recording {
 		gocv.PutText(&display, "RECORDING EVENT", image.Pt(20, 60),
-			gocv.FontHersheySimplex, 0.65, warnColor, 2)
+			gocv.FontHersheySimplex, 0.9, warnColor, 2)
 	} else {
 		gocv.PutText(&display, fmt.Sprintf("RAM PREBUFFER: %.0fs", settings.PreEventDuration.Seconds()),
-			image.Pt(20, 60), gocv.FontHersheySimplex, 0.5, textColor, 1)
+			image.Pt(20, 60), gocv.FontHersheySimplex, 0.75, textColor, 2)
 	}
 
 	if learningBackground {
 		gocv.PutText(&display, "LEARNING BACKGROUND...", image.Pt(20, 90),
-			gocv.FontHersheySimplex, 0.65, warnColor, 2)
+			gocv.FontHersheySimplex, 0.9, warnColor, 2)
 	}
 
 	elapsed := time.Duration(0)
@@ -449,7 +449,7 @@ func buildFrameUpdate(
 			formatVideoProgressDuration(totalDuration),
 			progress*100)
 		gocv.PutText(&display, progressText, image.Pt(20, 120),
-			gocv.FontHersheySimplex, 0.6, textColor, 2)
+			gocv.FontHersheySimplex, 0.85, textColor, 2)
 	}
 
 	update := FrameUpdate{

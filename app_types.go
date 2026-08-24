@@ -64,20 +64,20 @@ func DefaultTrackingSettingsForProfile(profile string) TrackingSettings {
 	default:
 		return TrackingSettings{
 			Profile:               trackingProfileGeneral,
-			MinArea:               6.0,
+			MinArea:               10.0,
 			MaxArea:               15000.0,
-			SlowMinSpeed:          10.0,
-			MinSpeed:              40.0,
+			SlowMinSpeed:          14.0,
+			MinSpeed:              55.0,
 			MaxMatchDistance:      100.0,
-			MinHits:               2,
+			MinHits:               3,
 			BlurSize:              5,
-			ForegroundThreshold:   200.0,
+			ForegroundThreshold:   220.0,
 			PreEventDuration:      5 * time.Second,
 			PostEventDuration:     5 * time.Second,
 			RawSegmentDuration:    0,
 			RawSegmentOverlap:     1 * time.Second,
 			MOG2History:           500,
-			MOG2VarThreshold:      16.0,
+			MOG2VarThreshold:      24.0,
 			TrackingROIHeightFrac: 0.90,
 		}
 	}
