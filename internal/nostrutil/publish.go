@@ -18,11 +18,12 @@ const (
 )
 
 type PublishOptions struct {
-	RelayURL  string
-	SecretKey string
-	Timeout   time.Duration
-	Content   string
-	Tags      nostr.Tags
+	RelayURL         string
+	SecretKey        string
+	Timeout          time.Duration
+	Content          string
+	Tags             nostr.Tags
+	BlossomServerURL string
 }
 
 func PublishTextNote(ctx context.Context, opts PublishOptions) (string, error) {
@@ -55,6 +56,11 @@ func PublishTextNote(ctx context.Context, opts PublishOptions) (string, error) {
 		defer cancel()
 	}
 
+	content, tags, err := prepareBlossomMedia(publishCtx, note, opts.Tags, opts.BlossomServerURL)
+	if err != nil {
+		return "", fmt.Errorf("prepare blossom media: %w", err)
+	}
+
 	relay, err := nostr.RelayConnect(publishCtx, relayURL)
 	if err != nil {
 		return "", fmt.Errorf("connect relay %s: %w", relayURL, err)
@@ -64,8 +70,8 @@ func PublishTextNote(ctx context.Context, opts PublishOptions) (string, error) {
 	event := nostr.Event{
 		CreatedAt: nostr.Now(),
 		Kind:      nostr.KindTextNote,
-		Content:   note,
-		Tags:      opts.Tags,
+		Content:   content,
+		Tags:      tags,
 	}
 	if err := event.Sign(secretKey); err != nil {
 		return "", fmt.Errorf("sign note: %w", err)

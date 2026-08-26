@@ -26,6 +26,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	relayURL := fs.String("relay", nostrutil.DefaultRelayURL, "relay websocket URL")
 	secret := fs.String("secret", "", "Nostr private key as nsec or 64-char hex (falls back to NOSTR_SECRET_KEY)")
 	content := fs.String("content", "", "note content; if empty, read from remaining args or stdin")
+	blossomURL := fs.String("blossom", nostrutil.DefaultBlossomServerURL, "Blossom media server base URL used for local image references")
 	timeout := fs.Duration("timeout", nostrutil.DefaultTimeout, "relay publish timeout")
 
 	if err := fs.Parse(args); err != nil {
@@ -50,10 +51,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 	eventID, err := nostrutil.PublishTextNote(ctx, nostrutil.PublishOptions{
-		RelayURL:  *relayURL,
-		SecretKey: *secret,
-		Timeout:   *timeout,
-		Content:   note,
+		RelayURL:         *relayURL,
+		SecretKey:        *secret,
+		Timeout:          *timeout,
+		Content:          note,
+		BlossomServerURL: *blossomURL,
 	})
 	if err != nil {
 		return err

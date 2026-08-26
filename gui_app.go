@@ -3263,10 +3263,11 @@ func (ui *trackerApp) sendNostrTestNote() {
 
 	go func() {
 		eventID, publishErr := nostrutil.PublishTextNote(context.Background(), nostrutil.PublishOptions{
-			RelayURL:  settings.RelayURL,
-			SecretKey: settings.SecretKey,
-			Timeout:   settings.Timeout,
-			Content:   content,
+			RelayURL:         settings.RelayURL,
+			SecretKey:        settings.SecretKey,
+			Timeout:          settings.Timeout,
+			Content:          content,
+			BlossomServerURL: nostrutil.DefaultBlossomServerURL,
 		})
 
 		fyne.Do(func() {
@@ -3903,11 +3904,12 @@ func (ui *trackerApp) publishVideoAnalysisNostrNote(dir string, config TrackerCo
 
 	content := ui.formatNostrEventSummary(detail, config)
 	_, err = nostrutil.PublishTextNote(context.Background(), nostrutil.PublishOptions{
-		RelayURL:  config.Nostr.RelayURL,
-		SecretKey: config.Nostr.SecretKey,
-		Timeout:   config.Nostr.Timeout,
-		Content:   content,
-		Tags:      ui.nostrImageTags(detail, config),
+		RelayURL:         config.Nostr.RelayURL,
+		SecretKey:        config.Nostr.SecretKey,
+		Timeout:          config.Nostr.Timeout,
+		Content:          content,
+		Tags:             ui.nostrImageTags(detail, config),
+		BlossomServerURL: nostrutil.DefaultBlossomServerURL,
 	})
 	if err != nil {
 		return err
@@ -3918,10 +3920,11 @@ func (ui *trackerApp) publishVideoAnalysisNostrNote(dir string, config TrackerCo
 func (ui *trackerApp) publishCompletedVideoAnalysisNostrNote(eventDirs []string, config TrackerConfig) error {
 	completionContent := fmt.Sprintf("Finished processing video file: %s", filepath.Base(config.Input))
 	if _, err := nostrutil.PublishTextNote(context.Background(), nostrutil.PublishOptions{
-		RelayURL:  config.Nostr.RelayURL,
-		SecretKey: config.Nostr.SecretKey,
-		Timeout:   config.Nostr.Timeout,
-		Content:   completionContent,
+		RelayURL:         config.Nostr.RelayURL,
+		SecretKey:        config.Nostr.SecretKey,
+		Timeout:          config.Nostr.Timeout,
+		Content:          completionContent,
+		BlossomServerURL: nostrutil.DefaultBlossomServerURL,
 	}); err != nil {
 		return err
 	}
@@ -3933,10 +3936,11 @@ func (ui *trackerApp) publishCompletedVideoAnalysisNostrNote(eventDirs []string,
 			config.Nostr.MinTrackDistance,
 		)
 		_, err := nostrutil.PublishTextNote(context.Background(), nostrutil.PublishOptions{
-			RelayURL:  config.Nostr.RelayURL,
-			SecretKey: config.Nostr.SecretKey,
-			Timeout:   config.Nostr.Timeout,
-			Content:   content,
+			RelayURL:         config.Nostr.RelayURL,
+			SecretKey:        config.Nostr.SecretKey,
+			Timeout:          config.Nostr.Timeout,
+			Content:          content,
+			BlossomServerURL: nostrutil.DefaultBlossomServerURL,
 		})
 		return err
 	}
@@ -3971,11 +3975,12 @@ func (ui *trackerApp) publishCompletedVideoAnalysisNostrNote(eventDirs []string,
 	}
 
 	_, err := nostrutil.PublishTextNote(context.Background(), nostrutil.PublishOptions{
-		RelayURL:  config.Nostr.RelayURL,
-		SecretKey: config.Nostr.SecretKey,
-		Timeout:   config.Nostr.Timeout,
-		Content:   strings.Join(lines, "\n"),
-		Tags:      dedupeNostrTags(tags),
+		RelayURL:         config.Nostr.RelayURL,
+		SecretKey:        config.Nostr.SecretKey,
+		Timeout:          config.Nostr.Timeout,
+		Content:          strings.Join(lines, "\n"),
+		Tags:             dedupeNostrTags(tags),
+		BlossomServerURL: nostrutil.DefaultBlossomServerURL,
 	})
 	return err
 }
@@ -4002,8 +4007,8 @@ func (ui *trackerApp) formatNostrEventSummary(detail eventHistoryDetail, config 
 	objectLines := make([]string, 0, len(qualified))
 	for _, object := range qualified {
 		lineParts := []string{fmt.Sprintf("#%04d", object.ID)}
-		if cropURL := ui.projectFileURL(representativeObjectCropPath(object)); cropURL != "" {
-			lineParts = append(lineParts, cropURL)
+		if cropPath := representativeObjectCropPath(object); cropPath != "" {
+			lineParts = append(lineParts, cropPath)
 		}
 		objectLines = append(objectLines, strings.Join(lineParts, "\n"))
 	}
@@ -4034,8 +4039,8 @@ func (ui *trackerApp) nostrImageTags(detail eventHistoryDetail, config TrackerCo
 
 	tags := make(nostr.Tags, 0, len(qualified))
 	for _, object := range qualified {
-		if cropURL := ui.projectFileURL(representativeObjectCropPath(object)); cropURL != "" {
-			tags = append(tags, nostr.Tag{"r", cropURL})
+		if cropPath := representativeObjectCropPath(object); cropPath != "" {
+			tags = append(tags, nostr.Tag{"x", cropPath})
 		}
 	}
 	return tags
