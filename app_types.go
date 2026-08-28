@@ -34,6 +34,7 @@ type TrackingSettings struct {
 	MOG2History           int
 	MOG2VarThreshold      float64
 	TrackingROIHeightFrac float64
+	GenerateObjectGIFs    bool
 }
 
 func DefaultTrackingSettings() TrackingSettings {

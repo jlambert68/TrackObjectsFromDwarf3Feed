@@ -7,6 +7,7 @@ require gocv.io/x/gocv v0.43.0
 require (
 	fyne.io/fyne/v2 v2.7.3
 	github.com/nbd-wtf/go-nostr v0.52.3
+	github.com/santhosh-tekuri/jsonschema/v5 v5.3.1
 	golang.org/x/net v0.55.0
 )
 

@@ -28,6 +28,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	content := fs.String("content", "", "note content; if empty, read from remaining args or stdin")
 	blossomURL := fs.String("blossom", nostrutil.DefaultBlossomServerURL, "Blossom media server base URL used for local image references")
 	timeout := fs.Duration("timeout", nostrutil.DefaultTimeout, "relay publish timeout")
+	blossomTimeout := fs.Duration("blossom-timeout", nostrutil.DefaultBlossomTimeout, "Blossom media upload timeout")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -48,12 +49,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return errors.New("missing note content; pass -content, a trailing argument, or pipe stdin")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
-	defer cancel()
-	eventID, err := nostrutil.PublishTextNote(ctx, nostrutil.PublishOptions{
+	eventID, err := nostrutil.PublishTextNote(context.Background(), nostrutil.PublishOptions{
 		RelayURL:         *relayURL,
 		SecretKey:        *secret,
 		Timeout:          *timeout,
+		BlossomTimeout:   *blossomTimeout,
 		Content:          note,
 		BlossomServerURL: *blossomURL,
 	})

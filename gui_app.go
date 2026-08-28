@@ -40,6 +40,16 @@ import (
 	"gocv.io/x/gocv"
 )
 
+func logErrorWithContext(prefix string, err error) {
+	if err == nil {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "ERROR: %s: %v\n", prefix, err)
+	for depth, cause := 1, errors.Unwrap(err); cause != nil; depth, cause = depth+1, errors.Unwrap(cause) {
+		fmt.Fprintf(os.Stderr, "  cause[%d]: %v\n", depth, cause)
+	}
+}
+
 type trackerApp struct {
 	window fyne.Window
 
@@ -77,10 +87,12 @@ type trackerApp struct {
 	mog2HistoryEntry         *widget.Entry
 	mog2VarThresholdEntry    *widget.Entry
 	roiHeightEntry           *widget.Entry
+	generateObjectGIFsCheck  *widget.Check
 	nostrEnableCheck         *widget.Check
 	nostrRelayEntry          *widget.Entry
 	nostrSecretEntry         *widget.Entry
 	nostrMinDistanceEntry    *widget.Entry
+	nostrUseObjectGIFCheck   *widget.Check
 	nostrTestMessageEntry    *widget.Entry
 
 	fileButton               *widget.Button
@@ -180,7 +192,7 @@ func (ui *trackerApp) showError(err error) {
 	if err == nil {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+	logErrorWithContext("ui", err)
 	dialog.ShowError(err, ui.window)
 }
 
@@ -440,6 +452,7 @@ type trackedObjectDetail struct {
 	AverageHeight  float64
 	CropCount      int
 	CropPaths      []string
+	GIFPath        string
 	FirstCropPath  string
 	LastCropPath   string
 	FirstPositionX int
@@ -532,12 +545,14 @@ const (
 	prefTrackingMOG2History = "tracking.mog2_history"
 	prefTrackingMOG2Var     = "tracking.mog2_var_threshold"
 	prefTrackingROIHeight   = "tracking.roi_height_fraction"
+	prefTrackingObjectGIFs  = "tracking.generate_object_gifs"
 	prefTrackingPresets     = "tracking.presets"
 	prefTrackingPresetName  = "tracking.preset_name"
 	prefNostrEnabled        = "nostr.enabled"
 	prefNostrRelayURL       = "nostr.relay_url"
 	prefNostrSecretKey      = "nostr.secret_key"
 	prefNostrMinDistance    = "nostr.min_track_distance"
+	prefNostrUseObjectGIF   = "nostr.use_object_gif"
 	prefNostrTestMessage    = "nostr.test_message"
 )
 
@@ -743,6 +758,7 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 	mog2VarThresholdEntry.SetText(formatFloat(defaults.MOG2VarThreshold))
 	roiHeightEntry := widget.NewEntry()
 	roiHeightEntry.SetText(formatFloat(defaults.TrackingROIHeightFrac))
+	generateObjectGIFsCheck := widget.NewCheck("Produce GIF for each found object's cut-outs", nil)
 	nostrEnableCheck := widget.NewCheck("Publish Nostr note after video analysis", nil)
 	nostrRelayEntry := widget.NewEntry()
 	nostrRelayEntry.SetPlaceHolder("ws://127.0.0.1:7447")
@@ -750,6 +766,7 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 	nostrSecretEntry.SetPlaceHolder("nsec... or 64-char hex secret")
 	nostrMinDistanceEntry := widget.NewEntry()
 	nostrMinDistanceEntry.SetText("800")
+	nostrUseObjectGIFCheck := widget.NewCheck("Use object GIF instead of static picture in Nostr note", nil)
 	nostrTestMessageEntry := widget.NewMultiLineEntry()
 	nostrTestMessageEntry.SetPlaceHolder("Write a Nostr test note")
 	nostrTestMessageEntry.Wrapping = fyne.TextWrapWord
@@ -790,10 +807,12 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 		mog2HistoryEntry:           mog2HistoryEntry,
 		mog2VarThresholdEntry:      mog2VarThresholdEntry,
 		roiHeightEntry:             roiHeightEntry,
+		generateObjectGIFsCheck:    generateObjectGIFsCheck,
 		nostrEnableCheck:           nostrEnableCheck,
 		nostrRelayEntry:            nostrRelayEntry,
 		nostrSecretEntry:           nostrSecretEntry,
 		nostrMinDistanceEntry:      nostrMinDistanceEntry,
+		nostrUseObjectGIFCheck:     nostrUseObjectGIFCheck,
 		nostrTestMessageEntry:      nostrTestMessageEntry,
 		videoImage:                 videoImage,
 		maskImage:                  maskImage,
@@ -1015,6 +1034,7 @@ func (ui *trackerApp) buildUI() fyne.CanvasObject {
 				container.NewBorder(nil, nil, widget.NewLabel("MOG2 Var Threshold"), nil, ui.mog2VarThresholdEntry),
 				container.NewBorder(nil, nil, widget.NewLabel("ROI Height Fraction"), nil, ui.roiHeightEntry),
 			),
+			ui.generateObjectGIFsCheck,
 		)),
 	)
 
@@ -1024,6 +1044,7 @@ func (ui *trackerApp) buildUI() fyne.CanvasObject {
 			container.NewBorder(nil, nil, widget.NewLabel("Relay URL"), nil, ui.nostrRelayEntry),
 			container.NewBorder(nil, nil, widget.NewLabel("Secret Key"), nil, ui.nostrSecretEntry),
 			container.NewBorder(nil, nil, widget.NewLabel("Min Straight-Line Track Px"), nil, ui.nostrMinDistanceEntry),
+			ui.nostrUseObjectGIFCheck,
 			widget.NewLabel("Test Note"),
 			ui.nostrTestMessageEntry,
 			container.NewHBox(ui.sendNostrTestButton),
@@ -3004,10 +3025,12 @@ func (ui *trackerApp) loadTrackingPreferences() {
 	ui.mog2HistoryEntry.SetText(prefs.StringWithFallback(prefTrackingMOG2History, strconv.Itoa(defaults.MOG2History)))
 	ui.mog2VarThresholdEntry.SetText(prefs.StringWithFallback(prefTrackingMOG2Var, formatFloat(defaults.MOG2VarThreshold)))
 	ui.roiHeightEntry.SetText(prefs.StringWithFallback(prefTrackingROIHeight, formatFloat(defaults.TrackingROIHeightFrac)))
+	ui.generateObjectGIFsCheck.SetChecked(prefs.BoolWithFallback(prefTrackingObjectGIFs, defaults.GenerateObjectGIFs))
 	ui.nostrEnableCheck.SetChecked(prefs.BoolWithFallback(prefNostrEnabled, false))
 	ui.nostrRelayEntry.SetText(prefs.StringWithFallback(prefNostrRelayURL, nostrutil.DefaultRelayURL))
 	ui.nostrSecretEntry.SetText(prefs.StringWithFallback(prefNostrSecretKey, ""))
 	ui.nostrMinDistanceEntry.SetText(prefs.StringWithFallback(prefNostrMinDistance, "800"))
+	ui.nostrUseObjectGIFCheck.SetChecked(prefs.BoolWithFallback(prefNostrUseObjectGIF, false))
 	nostrTestMessage := prefs.StringWithFallback(prefNostrTestMessage, "")
 	if nostrTestMessage == "" || nostrTestMessage == "Nostr integration test" {
 		nostrTestMessage = defaultNostrTestMessage
@@ -3032,10 +3055,12 @@ func (ui *trackerApp) saveTrackingPreferences() {
 	prefs.SetString(prefTrackingMOG2History, ui.mog2HistoryEntry.Text)
 	prefs.SetString(prefTrackingMOG2Var, ui.mog2VarThresholdEntry.Text)
 	prefs.SetString(prefTrackingROIHeight, ui.roiHeightEntry.Text)
+	prefs.SetBool(prefTrackingObjectGIFs, ui.generateObjectGIFsCheck.Checked)
 	prefs.SetBool(prefNostrEnabled, ui.nostrEnableCheck.Checked)
 	prefs.SetString(prefNostrRelayURL, ui.nostrRelayEntry.Text)
 	prefs.SetString(prefNostrSecretKey, ui.nostrSecretEntry.Text)
 	prefs.SetString(prefNostrMinDistance, ui.nostrMinDistanceEntry.Text)
+	prefs.SetBool(prefNostrUseObjectGIF, ui.nostrUseObjectGIFCheck.Checked)
 	prefs.SetString(prefNostrTestMessage, ui.nostrTestMessageEntry.Text)
 }
 
@@ -3106,6 +3131,7 @@ func (ui *trackerApp) applyTrackingSettingsToForm(settings TrackingSettings) {
 	ui.mog2HistoryEntry.SetText(strconv.Itoa(settings.MOG2History))
 	ui.mog2VarThresholdEntry.SetText(formatFloat(settings.MOG2VarThreshold))
 	ui.roiHeightEntry.SetText(formatFloat(settings.TrackingROIHeightFrac))
+	ui.generateObjectGIFsCheck.SetChecked(settings.GenerateObjectGIFs)
 }
 
 func (ui *trackerApp) buildTrackingSettings() (TrackingSettings, error) {
@@ -3191,6 +3217,7 @@ func (ui *trackerApp) buildTrackingSettings() (TrackingSettings, error) {
 	if settings.TrackingROIHeightFrac <= 0 || settings.TrackingROIHeightFrac > 1 {
 		return TrackingSettings{}, errors.New("ROI Height Fraction must be in the range (0, 1]")
 	}
+	settings.GenerateObjectGIFs = ui.generateObjectGIFsCheck.Checked
 
 	ui.saveTrackingPreferences()
 	return settings, nil
@@ -3198,10 +3225,11 @@ func (ui *trackerApp) buildTrackingSettings() (TrackingSettings, error) {
 
 func (ui *trackerApp) buildNostrSettings() (NostrSettings, error) {
 	settings := NostrSettings{
-		Enabled:   ui.nostrEnableCheck.Checked,
-		RelayURL:  strings.TrimSpace(ui.nostrRelayEntry.Text),
-		SecretKey: strings.TrimSpace(ui.nostrSecretEntry.Text),
-		Timeout:   nostrutil.DefaultTimeout,
+		Enabled:      ui.nostrEnableCheck.Checked,
+		RelayURL:     strings.TrimSpace(ui.nostrRelayEntry.Text),
+		SecretKey:    strings.TrimSpace(ui.nostrSecretEntry.Text),
+		UseObjectGIF: ui.nostrUseObjectGIFCheck.Checked,
+		Timeout:      nostrutil.DefaultTimeout,
 	}
 
 	minDistanceText := strings.TrimSpace(ui.nostrMinDistanceEntry.Text)
@@ -3903,22 +3931,33 @@ func (ui *trackerApp) publishVideoAnalysisNostrNote(dir string, config TrackerCo
 	}
 
 	content := ui.formatNostrEventSummary(detail, config)
+	tags := ui.nostrImageTags(detail, config)
+	fmt.Fprintf(
+		os.Stderr,
+		"nostr publish event=%s input=%s media_mode=%s tag_count=%d media_paths=%v\n",
+		dir,
+		config.Input,
+		map[bool]string{true: "gif", false: "static"}[config.Nostr.UseObjectGIF],
+		len(tags),
+		nostrTagValues(tags),
+	)
 	_, err = nostrutil.PublishTextNote(context.Background(), nostrutil.PublishOptions{
 		RelayURL:         config.Nostr.RelayURL,
 		SecretKey:        config.Nostr.SecretKey,
 		Timeout:          config.Nostr.Timeout,
 		Content:          content,
-		Tags:             ui.nostrImageTags(detail, config),
+		Tags:             tags,
 		BlossomServerURL: nostrutil.DefaultBlossomServerURL,
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("publish event note for %s with %d media tag(s): %w", dir, len(tags), err)
 	}
 	return nil
 }
 
 func (ui *trackerApp) publishCompletedVideoAnalysisNostrNote(eventDirs []string, config TrackerConfig) error {
 	completionContent := fmt.Sprintf("Finished processing video file: %s", filepath.Base(config.Input))
+	fmt.Fprintf(os.Stderr, "nostr publish completion input=%s event_count=%d relay=%s media_mode=%s\n", config.Input, len(eventDirs), config.Nostr.RelayURL, map[bool]string{true: "gif", false: "static"}[config.Nostr.UseObjectGIF])
 	if _, err := nostrutil.PublishTextNote(context.Background(), nostrutil.PublishOptions{
 		RelayURL:         config.Nostr.RelayURL,
 		SecretKey:        config.Nostr.SecretKey,
@@ -3926,7 +3965,7 @@ func (ui *trackerApp) publishCompletedVideoAnalysisNostrNote(eventDirs []string,
 		Content:          completionContent,
 		BlossomServerURL: nostrutil.DefaultBlossomServerURL,
 	}); err != nil {
-		return err
+		return fmt.Errorf("publish completion note for %s: %w", config.Input, err)
 	}
 
 	if len(eventDirs) == 0 {
@@ -3942,7 +3981,10 @@ func (ui *trackerApp) publishCompletedVideoAnalysisNostrNote(eventDirs []string,
 			Content:          content,
 			BlossomServerURL: nostrutil.DefaultBlossomServerURL,
 		})
-		return err
+		if err != nil {
+			return fmt.Errorf("publish no-events note for %s: %w", config.Input, err)
+		}
+		return nil
 	}
 
 	if len(eventDirs) == 1 {
@@ -3974,15 +4016,20 @@ func (ui *trackerApp) publishCompletedVideoAnalysisNostrNote(eventDirs []string,
 		tags = append(tags, ui.nostrImageTags(detail, config)...)
 	}
 
+	dedupedTags := dedupeNostrTags(tags)
+	fmt.Fprintf(os.Stderr, "nostr publish aggregate input=%s aggregate_tag_count=%d media_paths=%v\n", config.Input, len(dedupedTags), nostrTagValues(dedupedTags))
 	_, err := nostrutil.PublishTextNote(context.Background(), nostrutil.PublishOptions{
 		RelayURL:         config.Nostr.RelayURL,
 		SecretKey:        config.Nostr.SecretKey,
 		Timeout:          config.Nostr.Timeout,
 		Content:          strings.Join(lines, "\n"),
-		Tags:             dedupeNostrTags(tags),
+		Tags:             dedupedTags,
 		BlossomServerURL: nostrutil.DefaultBlossomServerURL,
 	})
-	return err
+	if err != nil {
+		return fmt.Errorf("publish aggregate note for %s with %d media tag(s): %w", config.Input, len(dedupedTags), err)
+	}
+	return nil
 }
 
 func (ui *trackerApp) formatNostrEventSummary(detail eventHistoryDetail, config TrackerConfig) string {
@@ -4007,8 +4054,8 @@ func (ui *trackerApp) formatNostrEventSummary(detail eventHistoryDetail, config 
 	objectLines := make([]string, 0, len(qualified))
 	for _, object := range qualified {
 		lineParts := []string{fmt.Sprintf("#%04d", object.ID)}
-		if cropPath := representativeObjectCropPath(object); cropPath != "" {
-			lineParts = append(lineParts, cropPath)
+		if mediaPath := ui.representativeObjectMediaPath(object, config.Nostr.UseObjectGIF); mediaPath != "" {
+			lineParts = append(lineParts, mediaPath)
 		}
 		objectLines = append(objectLines, strings.Join(lineParts, "\n"))
 	}
@@ -4039,8 +4086,8 @@ func (ui *trackerApp) nostrImageTags(detail eventHistoryDetail, config TrackerCo
 
 	tags := make(nostr.Tags, 0, len(qualified))
 	for _, object := range qualified {
-		if cropPath := representativeObjectCropPath(object); cropPath != "" {
-			tags = append(tags, nostr.Tag{"x", cropPath})
+		if mediaPath := ui.representativeObjectMediaPath(object, config.Nostr.UseObjectGIF); mediaPath != "" {
+			tags = append(tags, nostr.Tag{"x", mediaPath})
 		}
 	}
 	return tags
@@ -4061,6 +4108,19 @@ func dedupeNostrTags(tags nostr.Tags) nostr.Tags {
 		result = append(result, tag)
 	}
 	return result
+}
+
+func nostrTagValues(tags nostr.Tags) []string {
+	if len(tags) == 0 {
+		return nil
+	}
+	values := make([]string, 0, len(tags))
+	for _, tag := range tags {
+		if len(tag) >= 2 {
+			values = append(values, tag[1])
+		}
+	}
+	return values
 }
 
 func loadEventDetail(entry eventHistoryEntry) (eventHistoryDetail, error) {
@@ -4167,12 +4227,14 @@ func loadEventDetail(entry eventHistoryEntry) (eventHistoryDetail, error) {
 
 	cropsRoot := filepath.Join(entry.Directory, detail.Summary.TrackCropsDir)
 	for id, object := range objectMap {
+		objectDir := filepath.Join(cropsRoot, fmt.Sprintf("object_%04d", id))
 		crops, err := listObjectCropPaths(filepath.Join(cropsRoot, fmt.Sprintf("object_%04d", id)))
 		if err != nil {
 			return detail, err
 		}
 		object.CropPaths = crops
 		object.CropCount = len(crops)
+		object.GIFPath = objectGIFPath(objectDir)
 		if len(crops) > 0 {
 			object.FirstCropPath = crops[0]
 			object.LastCropPath = crops[len(crops)-1]
@@ -4256,6 +4318,10 @@ func listObjectCropPaths(dir string) ([]string, error) {
 	paths := make([]string, 0, len(items))
 	for _, item := range items {
 		if item.IsDir() {
+			continue
+		}
+		name := strings.ToLower(item.Name())
+		if !strings.HasSuffix(name, ".jpg") && !strings.HasSuffix(name, ".jpeg") && !strings.HasSuffix(name, ".png") {
 			continue
 		}
 		paths = append(paths, filepath.Join(dir, item.Name()))
@@ -4396,6 +4462,34 @@ func representativeObjectCropPath(object trackedObjectDetail) string {
 		return object.CropPaths[0]
 	}
 	return ""
+}
+
+func objectGIFPath(objectDir string) string {
+	gifPath := filepath.Join(objectDir, "object.gif")
+	if _, err := os.Stat(gifPath); err == nil {
+		return gifPath
+	}
+	return ""
+}
+
+func (ui *trackerApp) representativeObjectMediaPath(object trackedObjectDetail, preferGIF bool) string {
+	if preferGIF {
+		objectDir := ""
+		if object.GIFPath != "" {
+			objectDir = filepath.Dir(object.GIFPath)
+		} else if len(object.CropPaths) > 0 {
+			objectDir = filepath.Dir(object.CropPaths[0])
+		}
+		if objectDir != "" {
+			gifPath, err := ensureObjectGIF(objectDir)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "nostr gif generation failed object_id=%d object_dir=%s: %v\n", object.ID, objectDir, err)
+			} else if gifPath != "" {
+				return gifPath
+			}
+		}
+	}
+	return representativeObjectCropPath(object)
 }
 
 func loadObjectListPreview(object trackedObjectDetail) image.Image {

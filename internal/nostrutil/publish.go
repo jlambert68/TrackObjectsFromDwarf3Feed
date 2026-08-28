@@ -2,8 +2,11 @@ package nostrutil
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -13,14 +16,16 @@ import (
 )
 
 const (
-	DefaultRelayURL = "ws://127.0.0.1:7447"
-	DefaultTimeout  = 10 * time.Second
+	DefaultRelayURL       = "ws://127.0.0.1:7447"
+	DefaultTimeout        = 10 * time.Second
+	DefaultBlossomTimeout = 45 * time.Second
 )
 
 type PublishOptions struct {
 	RelayURL         string
 	SecretKey        string
 	Timeout          time.Duration
+	BlossomTimeout   time.Duration
 	Content          string
 	Tags             nostr.Tags
 	BlossomServerURL string
@@ -42,24 +47,37 @@ func PublishTextNote(ctx context.Context, opts PublishOptions) (string, error) {
 		return "", err
 	}
 
+	baseCtx := ctx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+
+	blossomTimeout := opts.BlossomTimeout
+	if blossomTimeout <= 0 {
+		blossomTimeout = DefaultBlossomTimeout
+	}
+	blossomCtx, cancelBlossom := context.WithTimeout(baseCtx, blossomTimeout)
+	defer cancelBlossom()
+
+	content, tags, err := prepareBlossomMedia(blossomCtx, note, opts.Tags, opts.BlossomServerURL, secretKey)
+	if err != nil {
+		if fallbackContent, fallbackTags, ok := blossomTextFallback(note, opts.Tags, err); ok {
+			fmt.Fprintf(os.Stderr, "nostr blossom upload failed, continuing with text-only note: %v\n", err)
+			content = fallbackContent
+			tags = fallbackTags
+		} else if errors.Is(err, context.DeadlineExceeded) {
+			return "", fmt.Errorf("prepare blossom media via %s exceeded timeout after %s: %w", strings.TrimSpace(opts.BlossomServerURL), blossomTimeout, err)
+		} else {
+			return "", fmt.Errorf("prepare blossom media: %w", err)
+		}
+	}
+
 	timeout := opts.Timeout
 	if timeout <= 0 {
 		timeout = DefaultTimeout
 	}
-	publishCtx := ctx
-	var cancel context.CancelFunc
-	if publishCtx == nil {
-		publishCtx = context.Background()
-	}
-	if _, hasDeadline := publishCtx.Deadline(); !hasDeadline {
-		publishCtx, cancel = context.WithTimeout(publishCtx, timeout)
-		defer cancel()
-	}
-
-	content, tags, err := prepareBlossomMedia(publishCtx, note, opts.Tags, opts.BlossomServerURL)
-	if err != nil {
-		return "", fmt.Errorf("prepare blossom media: %w", err)
-	}
+	publishCtx, cancelPublish := context.WithTimeout(baseCtx, timeout)
+	defer cancelPublish()
 
 	relay, err := nostr.RelayConnect(publishCtx, relayURL)
 	if err != nil {
@@ -76,6 +94,14 @@ func PublishTextNote(ctx context.Context, opts PublishOptions) (string, error) {
 	if err := event.Sign(secretKey); err != nil {
 		return "", fmt.Errorf("sign note: %w", err)
 	}
+	if err := validateEventAgainstSchema(event); err != nil {
+		return "", err
+	}
+	eventJSON, err := json.Marshal(event)
+	if err != nil {
+		return "", fmt.Errorf("marshal signed note: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "nostr event json: %s\n", eventJSON)
 
 	if err := relay.Publish(publishCtx, event); err != nil {
 		return "", fmt.Errorf("publish note: %w", err)
@@ -112,4 +138,59 @@ func ResolveSecretKey(value string) (string, error) {
 		return "", errors.New("hex secret key must be 64 characters")
 	}
 	return value, nil
+}
+
+func blossomTextFallback(content string, tags nostr.Tags, err error) (string, nostr.Tags, bool) {
+	if !shouldFallbackWithoutBlossom(err) {
+		return "", nil, false
+	}
+
+	sanitizedContent := stripLocalImageLines(content)
+	if strings.TrimSpace(sanitizedContent) == "" {
+		return "", nil, false
+	}
+	if sanitizedContent == content && len(tags) == 0 {
+		return "", nil, false
+	}
+	return sanitizedContent, nil, true
+}
+
+func shouldFallbackWithoutBlossom(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return true
+	}
+
+	var statusErr *blossomStatusError
+	if errors.As(err, &statusErr) && statusErr.StatusCode >= 500 {
+		return true
+	}
+
+	return false
+}
+
+func stripLocalImageLines(content string) string {
+	if strings.TrimSpace(content) == "" {
+		return content
+	}
+
+	lines := strings.Split(content, "\n")
+	filtered := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if _, ok := localImagePathFromReference(strings.TrimSpace(line)); ok {
+			continue
+		}
+		filtered = append(filtered, line)
+	}
+
+	return strings.TrimSpace(strings.Join(filtered, "\n"))
 }

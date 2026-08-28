@@ -30,6 +30,7 @@ type NostrSettings struct {
 	RelayURL         string
 	SecretKey        string
 	MinTrackDistance float64
+	UseObjectGIF     bool
 	Timeout          time.Duration
 }
 

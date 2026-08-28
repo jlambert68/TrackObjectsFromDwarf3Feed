@@ -5,8 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"image/color/palette"
+	"image/draw"
+	"image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"gocv.io/x/gocv"
@@ -277,6 +284,149 @@ func (r *EventRecorder) Finish(endedAt time.Time) error {
 	}
 
 	return errors.Join(errs...)
+}
+
+func ensureObjectGIF(objectDir string) (string, error) {
+	outputPath := filepath.Join(objectDir, "object.gif")
+	if _, err := os.Stat(outputPath); err == nil {
+		return outputPath, nil
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("stat object gif %s: %w", outputPath, err)
+	}
+
+	cropPaths, err := listTrackCropPathsForGIF(objectDir)
+	if err != nil {
+		return "", err
+	}
+	if len(cropPaths) == 0 {
+		return "", nil
+	}
+
+	fmt.Fprintf(os.Stderr, "gif generation writing object_dir=%s output=%s frame_count=%d\n", objectDir, outputPath, len(cropPaths))
+	if err := writeObjectGIF(outputPath, cropPaths); err != nil {
+		return "", err
+	}
+	return outputPath, nil
+}
+
+func (r *EventRecorder) generateObjectGIFs() error {
+	root := filepath.Join(r.Directory, "track_crops")
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("read track crops directory: %w", err)
+	}
+
+	var errs []error
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		objectDir := filepath.Join(root, entry.Name())
+		fmt.Fprintf(os.Stderr, "gif generation event=%s object_dir=%s\n", r.EventID, objectDir)
+		cropPaths, err := listTrackCropPathsForGIF(objectDir)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if len(cropPaths) == 0 {
+			fmt.Fprintf(os.Stderr, "gif generation skipped event=%s object_dir=%s reason=no-crop-frames\n", r.EventID, objectDir)
+			continue
+		}
+		outputPath, err := ensureObjectGIF(objectDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "gif generation failed event=%s object_dir=%s output=%s: %v\n", r.EventID, objectDir, outputPath, err)
+			errs = append(errs, err)
+			continue
+		}
+		if outputPath == "" {
+			fmt.Fprintf(os.Stderr, "gif generation skipped event=%s object_dir=%s reason=no-crop-frames\n", r.EventID, objectDir)
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "gif generation complete event=%s object_dir=%s output=%s frame_count=%d\n", r.EventID, objectDir, outputPath, len(cropPaths))
+	}
+	return errors.Join(errs...)
+}
+
+func listTrackCropPathsForGIF(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read track crop directory %s: %w", dir, err)
+	}
+
+	paths := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := strings.ToLower(entry.Name())
+		if !strings.HasSuffix(name, ".jpg") && !strings.HasSuffix(name, ".jpeg") && !strings.HasSuffix(name, ".png") {
+			continue
+		}
+		paths = append(paths, filepath.Join(dir, entry.Name()))
+	}
+	sort.Strings(paths)
+	return paths, nil
+}
+
+func writeObjectGIF(outputPath string, framePaths []string) error {
+	frames := make([]image.Image, 0, len(framePaths))
+	maxWidth := 0
+	maxHeight := 0
+	for _, framePath := range framePaths {
+		file, err := os.Open(framePath)
+		if err != nil {
+			return fmt.Errorf("open crop frame %s: %w", framePath, err)
+		}
+		img, _, err := image.Decode(file)
+		_ = file.Close()
+		if err != nil {
+			return fmt.Errorf("decode crop frame %s: %w", framePath, err)
+		}
+		frames = append(frames, img)
+		if width := img.Bounds().Dx(); width > maxWidth {
+			maxWidth = width
+		}
+		if height := img.Bounds().Dy(); height > maxHeight {
+			maxHeight = height
+		}
+	}
+	if len(frames) == 0 || maxWidth <= 0 || maxHeight <= 0 {
+		return nil
+	}
+
+	animation := &gif.GIF{
+		Image: make([]*image.Paletted, 0, len(frames)),
+		Delay: make([]int, 0, len(frames)),
+	}
+	canvasBounds := image.Rect(0, 0, maxWidth, maxHeight)
+	for _, frame := range frames {
+		rgba := image.NewRGBA(canvasBounds)
+		offset := image.Pt(
+			(maxWidth-frame.Bounds().Dx())/2,
+			(maxHeight-frame.Bounds().Dy())/2,
+		)
+		targetRect := image.Rectangle{Min: offset, Max: offset.Add(frame.Bounds().Size())}
+		draw.Draw(rgba, targetRect, frame, frame.Bounds().Min, draw.Src)
+
+		paletted := image.NewPaletted(canvasBounds, palette.Plan9)
+		draw.FloydSteinberg.Draw(paletted, canvasBounds, rgba, image.Point{})
+		animation.Image = append(animation.Image, paletted)
+		animation.Delay = append(animation.Delay, 6)
+	}
+	animation.LoopCount = 0
+
+	file, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("create object gif %s: %w", outputPath, err)
+	}
+	defer file.Close()
+	if err := gif.EncodeAll(file, animation); err != nil {
+		return fmt.Errorf("encode object gif %s: %w", outputPath, err)
+	}
+	return nil
 }
 
 func (r *EventRecorder) saveTrackCrops(frame gocv.Mat, meta FrameMetadata) error {
