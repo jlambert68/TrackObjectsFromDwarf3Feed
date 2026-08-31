@@ -16,6 +16,8 @@ import (
 	"strings"
 	"time"
 
+	"dwarf3-event-tracker/internal/applog"
+
 	"golang.org/x/net/websocket"
 )
 
@@ -864,7 +866,7 @@ func (c DwarfController) logWSDebug(format string, args ...any) {
 	if !c.DebugWS {
 		return
 	}
-	fmt.Fprintf(os.Stdout, "DWARF DEBUG: "+format+"\n", args...)
+	applog.DebugfID("f357e4d0-9cc6-4983-899e-a1376dbf7371", "DWARF DEBUG: "+format, args...)
 }
 
 func commandInterface(command map[string]any) int {

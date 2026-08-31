@@ -69,6 +69,7 @@ func TestPrepareBlossomMediaReplacesLocalImageReferences(t *testing.T) {
 		"object\n"+imagePath+"\n"+imagePath,
 		nostr.Tags{{"x", imagePath}},
 		"http://blossom.test",
+		"",
 		"d9beda766a3c0062e12e1c701e5c6e25c16aa3e6ad246f3c43b513949497ec2b",
 	)
 	if err != nil {
@@ -126,6 +127,7 @@ func TestPrepareBlossomMediaSynthesizesDescriptorFieldsFromUploadFallback(t *tes
 		imagePath,
 		nostr.Tags{{"x", imagePath}},
 		"http://blossom.test",
+		"",
 		"d9beda766a3c0062e12e1c701e5c6e25c16aa3e6ad246f3c43b513949497ec2b",
 	)
 	if err != nil {
@@ -180,6 +182,7 @@ func TestPrepareBlossomMediaCanonicalizesLoopbackBindAddress(t *testing.T) {
 		imagePath,
 		nostr.Tags{{"x", imagePath}},
 		"http://0.0.0.0:3000",
+		"",
 		"d9beda766a3c0062e12e1c701e5c6e25c16aa3e6ad246f3c43b513949497ec2b",
 	)
 	if err != nil {
@@ -193,6 +196,63 @@ func TestPrepareBlossomMediaCanonicalizesLoopbackBindAddress(t *testing.T) {
 	}
 	if tags[0][1] != "url "+wantURL {
 		t.Fatalf("unexpected imeta tag: %#v", tags[0])
+	}
+}
+
+func TestPrepareBlossomMediaUsesCustomNoteBaseURL(t *testing.T) {
+	tempDir := t.TempDir()
+	imagePath := filepath.Join(tempDir, "frame.jpg")
+	imageBytes := []byte("jpeg-bytes")
+	if err := os.WriteFile(imagePath, imageBytes, 0644); err != nil {
+		t.Fatalf("write image: %v", err)
+	}
+	wantHash := expectedImageHash(imageBytes)
+	wantURL := "https://notes.example/media/" + wantHash + ".jpg"
+
+	originalClient := http.DefaultClient
+	http.DefaultClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/media":
+			return jsonResponse(http.StatusNotFound, map[string]any{"error": "not found"}), nil
+		case "/upload":
+			return jsonResponse(http.StatusOK, map[string]any{
+				"sha256": wantHash,
+				"url":    "http://127.0.0.1:3000/" + wantHash + ".jpg",
+				"nip94": [][]string{
+					{"thumb", "http://127.0.0.1:3000/thumbs/" + wantHash + ".webp"},
+				},
+			}), nil
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+			return nil, nil
+		}
+	})}
+	t.Cleanup(func() {
+		http.DefaultClient = originalClient
+	})
+
+	content, tags, err := prepareBlossomMedia(
+		context.Background(),
+		imagePath,
+		nostr.Tags{{"x", imagePath}},
+		"http://127.0.0.1:3000",
+		"https://notes.example/media",
+		"d9beda766a3c0062e12e1c701e5c6e25c16aa3e6ad246f3c43b513949497ec2b",
+	)
+	if err != nil {
+		t.Fatalf("prepare blossom media: %v", err)
+	}
+	if content != wantURL {
+		t.Fatalf("unexpected content: %q", content)
+	}
+	if len(tags) != 1 {
+		t.Fatalf("unexpected tags: %#v", tags)
+	}
+	if tags[0][1] != "url "+wantURL {
+		t.Fatalf("unexpected imeta tag: %#v", tags[0])
+	}
+	if len(tags[0]) > 5 && tags[0][5] != "thumb https://notes.example/media/thumbs/"+wantHash+".webp" {
+		t.Fatalf("unexpected thumb tag: %#v", tags[0])
 	}
 }
 
@@ -221,6 +281,7 @@ func TestPrepareBlossomMediaLeavesNonImageReferencesAlone(t *testing.T) {
 		"note\n/tmp/not-an-image.txt",
 		nostr.Tags{{"x", "/tmp/not-an-image.txt"}},
 		"http://127.0.0.1:1",
+		"",
 		"d9beda766a3c0062e12e1c701e5c6e25c16aa3e6ad246f3c43b513949497ec2b",
 	)
 	if err != nil {
@@ -275,6 +336,7 @@ func TestPrepareBlossomMediaUploadsGIFDirectlyToUploadEndpoint(t *testing.T) {
 		imagePath,
 		nostr.Tags{{"x", imagePath}},
 		"http://blossom.test",
+		"",
 		"d9beda766a3c0062e12e1c701e5c6e25c16aa3e6ad246f3c43b513949497ec2b",
 	)
 	if err != nil {

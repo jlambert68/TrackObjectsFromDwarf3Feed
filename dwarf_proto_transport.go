@@ -6,12 +6,13 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"dwarf3-event-tracker/internal/applog"
 
 	"golang.org/x/net/websocket"
 )
@@ -380,7 +381,7 @@ func (t *DwarfProtoTransport) log(format string, args ...any) {
 	if !t.debug {
 		return
 	}
-	fmt.Fprintf(os.Stdout, "DWARF DEBUG: "+format+"\n", args...)
+	applog.DebugfID("4d313f82-4637-4d76-8dbd-18e05dc80a0e", "DWARF DEBUG: "+format, args...)
 }
 
 func isMatchingProtoReply(command DwarfProtoCommand, packet dwarfProtoPacket) bool {

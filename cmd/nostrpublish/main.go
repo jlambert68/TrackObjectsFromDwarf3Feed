@@ -27,6 +27,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	secret := fs.String("secret", "", "Nostr private key as nsec or 64-char hex (falls back to NOSTR_SECRET_KEY)")
 	content := fs.String("content", "", "note content; if empty, read from remaining args or stdin")
 	blossomURL := fs.String("blossom", nostrutil.DefaultBlossomServerURL, "Blossom media server base URL used for local image references")
+	blossomNoteURL := fs.String("blossom-note-base", "", "base URL written into note media references; defaults to -blossom")
 	timeout := fs.Duration("timeout", nostrutil.DefaultTimeout, "relay publish timeout")
 	blossomTimeout := fs.Duration("blossom-timeout", nostrutil.DefaultBlossomTimeout, "Blossom media upload timeout")
 
@@ -56,6 +57,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		BlossomTimeout:   *blossomTimeout,
 		Content:          note,
 		BlossomServerURL: *blossomURL,
+		BlossomNoteURL:   *blossomNoteURL,
 	})
 	if err != nil {
 		return err

@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"dwarf3-event-tracker/internal/applog"
+
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/nbd-wtf/go-nostr/nip19"
 )
@@ -29,6 +31,7 @@ type PublishOptions struct {
 	Content          string
 	Tags             nostr.Tags
 	BlossomServerURL string
+	BlossomNoteURL   string
 }
 
 func PublishTextNote(ctx context.Context, opts PublishOptions) (string, error) {
@@ -59,10 +62,16 @@ func PublishTextNote(ctx context.Context, opts PublishOptions) (string, error) {
 	blossomCtx, cancelBlossom := context.WithTimeout(baseCtx, blossomTimeout)
 	defer cancelBlossom()
 
-	content, tags, err := prepareBlossomMedia(blossomCtx, note, opts.Tags, opts.BlossomServerURL, secretKey)
+	applog.InfofID(
+		"32d1bc68-b2da-4df4-b004-72c412b3fd07",
+		"nostr blossom config: upload=%q note=%q",
+		strings.TrimSpace(opts.BlossomServerURL),
+		strings.TrimSpace(opts.BlossomNoteURL),
+	)
+	content, tags, err := prepareBlossomMedia(blossomCtx, note, opts.Tags, opts.BlossomServerURL, opts.BlossomNoteURL, secretKey)
 	if err != nil {
 		if fallbackContent, fallbackTags, ok := blossomTextFallback(note, opts.Tags, err); ok {
-			fmt.Fprintf(os.Stderr, "nostr blossom upload failed, continuing with text-only note: %v\n", err)
+			applog.ErrorfID("513c7d8d-df5a-47c4-bd77-5d4eb8e965ea", "nostr blossom upload failed, continuing with text-only note: %v", err)
 			content = fallbackContent
 			tags = fallbackTags
 		} else if errors.Is(err, context.DeadlineExceeded) {
@@ -101,7 +110,7 @@ func PublishTextNote(ctx context.Context, opts PublishOptions) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("marshal signed note: %w", err)
 	}
-	fmt.Fprintf(os.Stderr, "nostr event json: %s\n", eventJSON)
+	applog.InfofID("85536d4d-6e75-4828-b4e5-2b4804a064e1", "nostr event json: %s", eventJSON)
 
 	if err := relay.Publish(publishCtx, event); err != nil {
 		return "", fmt.Errorf("publish note: %w", err)

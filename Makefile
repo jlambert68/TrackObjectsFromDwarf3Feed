@@ -9,3 +9,6 @@ ShowDockerLogs:
 
 PublishNostrNote:
 	go run ./cmd/nostrpublish -content "tracking note"
+
+CheckUuidDuplictes:
+	python3 list_go_guids.py

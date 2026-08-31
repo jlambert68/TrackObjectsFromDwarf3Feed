@@ -29,6 +29,8 @@ type NostrSettings struct {
 	Enabled          bool
 	RelayURL         string
 	SecretKey        string
+	BlossomServerURL string
+	BlossomNoteURL   string
 	MinTrackDistance float64
 	UseObjectGIF     bool
 	Timeout          time.Duration

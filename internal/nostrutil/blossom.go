@@ -52,11 +52,12 @@ type BlossomProbeResult struct {
 	ResponseHeaders http.Header
 }
 
-func prepareBlossomMedia(ctx context.Context, content string, tags nostr.Tags, serverURL, secretKey string) (string, nostr.Tags, error) {
-	serverURL = canonicalBlossomServerURL(serverURL)
-	if serverURL == "" {
+func prepareBlossomMedia(ctx context.Context, content string, tags nostr.Tags, serverURL, noteURL, secretKey string) (string, nostr.Tags, error) {
+	uploadServerURL := canonicalBlossomServerURL(serverURL)
+	if uploadServerURL == "" {
 		return content, tags, nil
 	}
+	noteBaseURL := effectiveBlossomNoteBaseURL(uploadServerURL, noteURL)
 
 	cache := make(map[string]blossomBlobDescriptor)
 	resolveDescriptor := func(ref string) (blossomBlobDescriptor, bool, error) {
@@ -67,7 +68,7 @@ func prepareBlossomMedia(ctx context.Context, content string, tags nostr.Tags, s
 		if descriptor, ok := cache[localPath]; ok {
 			return descriptor, true, nil
 		}
-		descriptor, err := uploadImageToBlossom(ctx, serverURL, localPath, secretKey)
+		descriptor, err := uploadImageToBlossom(ctx, uploadServerURL, noteBaseURL, localPath, secretKey)
 		if err != nil {
 			return blossomBlobDescriptor{}, true, err
 		}
@@ -126,7 +127,7 @@ func prepareBlossomMedia(ctx context.Context, content string, tags nostr.Tags, s
 	return content, tags, nil
 }
 
-func uploadImageToBlossom(ctx context.Context, serverURL, path, secretKey string) (blossomBlobDescriptor, error) {
+func uploadImageToBlossom(ctx context.Context, serverURL, noteBaseURL, path, secretKey string) (blossomBlobDescriptor, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return blossomBlobDescriptor{}, fmt.Errorf("read image %s: %w", path, err)
@@ -156,7 +157,7 @@ func uploadImageToBlossom(ctx context.Context, serverURL, path, secretKey string
 			return blossomBlobDescriptor{}, err
 		}
 	}
-	descriptor = normalizeBlossomBlobDescriptor(strings.TrimRight(strings.TrimSpace(serverURL), "/"), descriptor, contentType, strings.ToLower(filepath.Ext(path)), int64(len(data)))
+	descriptor = normalizeBlossomBlobDescriptor(strings.TrimRight(strings.TrimSpace(serverURL), "/"), noteBaseURL, descriptor, contentType, strings.ToLower(filepath.Ext(path)), int64(len(data)))
 
 	hash := strings.TrimSpace(descriptor.SHA256)
 	if len(hash) != 64 {
@@ -389,7 +390,7 @@ func blossomAuthVerbForEndpoint(endpoint string) (string, error) {
 	}
 }
 
-func normalizeBlossomBlobDescriptor(serverURL string, descriptor blossomBlobDescriptor, contentType, originalExt string, size int64) blossomBlobDescriptor {
+func normalizeBlossomBlobDescriptor(uploadBaseURL, noteBaseURL string, descriptor blossomBlobDescriptor, contentType, originalExt string, size int64) blossomBlobDescriptor {
 	descriptor.SHA256 = strings.TrimSpace(descriptor.SHA256)
 	descriptor.URL = strings.TrimSpace(descriptor.URL)
 	descriptor.Type = strings.TrimSpace(descriptor.Type)
@@ -399,14 +400,63 @@ func normalizeBlossomBlobDescriptor(serverURL string, descriptor blossomBlobDesc
 	if descriptor.Size <= 0 {
 		descriptor.Size = size
 	}
-	if descriptor.URL == "" && descriptor.SHA256 != "" {
-		blobURL := strings.TrimRight(serverURL, "/") + "/" + descriptor.SHA256
-		if ext := preferredBlossomFileExtension(descriptor.Type, originalExt); ext != "" {
-			blobURL += ext
-		}
-		descriptor.URL = blobURL
+	if noteBaseURL != "" && descriptor.SHA256 != "" {
+		descriptor.URL = blossomBlobURL(noteBaseURL, descriptor.SHA256, descriptor.Type, originalExt)
+	} else if descriptor.URL == "" && descriptor.SHA256 != "" {
+		descriptor.URL = blossomBlobURL(noteBaseURL, descriptor.SHA256, descriptor.Type, originalExt)
 	}
+	descriptor.NIP94 = rewriteBlossomNIP94URLs(uploadBaseURL, noteBaseURL, descriptor.NIP94)
 	return descriptor
+}
+
+func effectiveBlossomNoteBaseURL(uploadServerURL, noteURL string) string {
+	trimmed := strings.TrimRight(strings.TrimSpace(noteURL), "/")
+	if trimmed != "" {
+		return trimmed
+	}
+	return strings.TrimRight(strings.TrimSpace(uploadServerURL), "/")
+}
+
+func blossomBlobURL(baseURL, sha256Value, mimeType, originalExt string) string {
+	blobURL := strings.TrimRight(strings.TrimSpace(baseURL), "/") + "/" + sha256Value
+	if ext := preferredBlossomFileExtension(mimeType, originalExt); ext != "" {
+		blobURL += ext
+	}
+	return blobURL
+}
+
+func rewriteBlossomNIP94URLs(uploadBaseURL, noteBaseURL string, entries [][]string) [][]string {
+	uploadBaseURL = strings.TrimRight(strings.TrimSpace(uploadBaseURL), "/")
+	noteBaseURL = strings.TrimRight(strings.TrimSpace(noteBaseURL), "/")
+	if uploadBaseURL == "" || noteBaseURL == "" || uploadBaseURL == noteBaseURL || len(entries) == 0 {
+		return entries
+	}
+
+	rewritten := make([][]string, 0, len(entries))
+	for _, entry := range entries {
+		cloned := append([]string(nil), entry...)
+		if len(cloned) > 1 {
+			switch strings.TrimSpace(cloned[0]) {
+			case "url", "thumb":
+				for i := 1; i < len(cloned); i++ {
+					cloned[i] = rewriteBlossomURLBase(cloned[i], uploadBaseURL, noteBaseURL)
+				}
+			}
+		}
+		rewritten = append(rewritten, cloned)
+	}
+	return rewritten
+}
+
+func rewriteBlossomURLBase(value, uploadBaseURL, noteBaseURL string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return value
+	}
+	if !strings.HasPrefix(trimmed, uploadBaseURL+"/") {
+		return value
+	}
+	return noteBaseURL + strings.TrimPrefix(trimmed, uploadBaseURL)
 }
 
 func preferredBlossomFileExtension(mimeType, originalExt string) string {

@@ -16,6 +16,8 @@ import (
 	"strings"
 	"time"
 
+	"dwarf3-event-tracker/internal/applog"
+
 	"gocv.io/x/gocv"
 )
 
@@ -302,7 +304,7 @@ func ensureObjectGIF(objectDir string) (string, error) {
 		return "", nil
 	}
 
-	fmt.Fprintf(os.Stderr, "gif generation writing object_dir=%s output=%s frame_count=%d\n", objectDir, outputPath, len(cropPaths))
+	applog.InfofID("60f93aae-52df-4341-aa72-b8b7fd31540d", "gif generation writing object_dir=%s output=%s frame_count=%d", objectDir, outputPath, len(cropPaths))
 	if err := writeObjectGIF(outputPath, cropPaths); err != nil {
 		return "", err
 	}
@@ -325,27 +327,27 @@ func (r *EventRecorder) generateObjectGIFs() error {
 			continue
 		}
 		objectDir := filepath.Join(root, entry.Name())
-		fmt.Fprintf(os.Stderr, "gif generation event=%s object_dir=%s\n", r.EventID, objectDir)
+		applog.InfofID("7fe1e4bd-90fc-4767-aef9-540c6fb7c6ae", "gif generation event=%s object_dir=%s", r.EventID, objectDir)
 		cropPaths, err := listTrackCropPathsForGIF(objectDir)
 		if err != nil {
 			errs = append(errs, err)
 			continue
 		}
 		if len(cropPaths) == 0 {
-			fmt.Fprintf(os.Stderr, "gif generation skipped event=%s object_dir=%s reason=no-crop-frames\n", r.EventID, objectDir)
+			applog.InfofID("160da204-f40d-4894-a689-c9a325d37375", "gif generation skipped event=%s object_dir=%s reason=no-crop-frames", r.EventID, objectDir)
 			continue
 		}
 		outputPath, err := ensureObjectGIF(objectDir)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "gif generation failed event=%s object_dir=%s output=%s: %v\n", r.EventID, objectDir, outputPath, err)
+			applog.ErrorfID("4dcc36b7-b026-4c17-9ad5-bdc71e0a75d1", "gif generation failed event=%s object_dir=%s output=%s error=%v", r.EventID, objectDir, outputPath, err)
 			errs = append(errs, err)
 			continue
 		}
 		if outputPath == "" {
-			fmt.Fprintf(os.Stderr, "gif generation skipped event=%s object_dir=%s reason=no-crop-frames\n", r.EventID, objectDir)
+			applog.InfofID("728fcf9a-5989-4ac4-a306-2a3ef2030f96", "gif generation skipped event=%s object_dir=%s reason=no-crop-frames", r.EventID, objectDir)
 			continue
 		}
-		fmt.Fprintf(os.Stderr, "gif generation complete event=%s object_dir=%s output=%s frame_count=%d\n", r.EventID, objectDir, outputPath, len(cropPaths))
+		applog.InfofID("1d878f7d-bf13-40ba-baf9-31f80285d739", "gif generation complete event=%s object_dir=%s output=%s frame_count=%d", r.EventID, objectDir, outputPath, len(cropPaths))
 	}
 	return errors.Join(errs...)
 }

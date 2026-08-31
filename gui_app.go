@@ -14,10 +14,12 @@ import (
 	"image"
 	"image/color"
 	"image/draw"
+	"io"
 	"math"
 	"math/big"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -26,6 +28,7 @@ import (
 	"sync"
 	"time"
 
+	"dwarf3-event-tracker/internal/applog"
 	"dwarf3-event-tracker/internal/nostrutil"
 
 	"fyne.io/fyne/v2"
@@ -44,9 +47,9 @@ func logErrorWithContext(prefix string, err error) {
 	if err == nil {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "ERROR: %s: %v\n", prefix, err)
+	applog.ErrorfID("7d394a42-f4f0-4b41-8b89-2ce3e595ab22", "%s: %v", prefix, err)
 	for depth, cause := 1, errors.Unwrap(err); cause != nil; depth, cause = depth+1, errors.Unwrap(cause) {
-		fmt.Fprintf(os.Stderr, "  cause[%d]: %v\n", depth, cause)
+		applog.ErrorfID("c10b6f22-0c53-433f-a2e9-7e467c5af0bf", "%s cause[%d]: %v", prefix, depth, cause)
 	}
 }
 
@@ -91,6 +94,8 @@ type trackerApp struct {
 	nostrEnableCheck         *widget.Check
 	nostrRelayEntry          *widget.Entry
 	nostrSecretEntry         *widget.Entry
+	nostrBlossomEntry        *widget.Entry
+	nostrBlossomNoteEntry    *widget.Entry
 	nostrMinDistanceEntry    *widget.Entry
 	nostrUseObjectGIFCheck   *widget.Check
 	nostrTestMessageEntry    *widget.Entry
@@ -122,6 +127,8 @@ type trackerApp struct {
 	saveObjectNameButton     *widget.Button
 	playPauseButton          *widget.Button
 	sendNostrTestButton      *widget.Button
+	copyExternalIPButton     *widget.Button
+	copyIntranetIPButton     *widget.Button
 
 	videoImage     *canvas.Image
 	maskImage      *canvas.Image
@@ -133,6 +140,8 @@ type trackerApp struct {
 	statusLabel                *widget.Label
 	eventLabel                 *widget.Label
 	mediaServerLabel           *widget.Label
+	externalIPLabel            *widget.Label
+	intranetIPLabel            *widget.Label
 	dwarfStatusLabel           *widget.Label
 	dwarfQueueLabel            *widget.Label
 	playbackLabel              *widget.Label
@@ -186,6 +195,8 @@ type trackerApp struct {
 	mediaServerBaseURL      string
 	mediaTLSCertPath        string
 	mediaTLSKeyPath         string
+	externalIP              string
+	intranetIP              string
 }
 
 func (ui *trackerApp) showError(err error) {
@@ -197,7 +208,7 @@ func (ui *trackerApp) showError(err error) {
 }
 
 func (ui *trackerApp) showInfo(title, message string) {
-	fmt.Fprintf(os.Stdout, "INFO [%s]: %s\n", title, message)
+	applog.InfofID("98f59664-b6bf-40af-9cf4-a6db8b3501e0", "%s: %s", title, message)
 	dialog.ShowInformation(title, message, ui.window)
 }
 
@@ -226,7 +237,7 @@ func (ui *trackerApp) startMediaServer() error {
 
 	go func() {
 		if serveErr := ui.mediaHTTPServer.Serve(ui.mediaHTTPListener); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
-			fmt.Fprintf(os.Stderr, "media http server failed: %v\n", serveErr)
+			applog.ErrorfID("270ff374-1fde-4dd0-ae67-f38d65ff9407", "media http server failed: %v", serveErr)
 			fyne.Do(func() {
 				ui.mediaServerLabel.SetText("Media HTTP: failed")
 			})
@@ -254,7 +265,7 @@ func (ui *trackerApp) startMediaServer() error {
 		if ui.mediaHTTPSListener != nil {
 			go func() {
 				if serveErr := ui.mediaHTTPSServer.Serve(ui.mediaHTTPSListener); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
-					fmt.Fprintf(os.Stderr, "media https server failed: %v\n", serveErr)
+					applog.ErrorfID("d3a0b394-2b29-4c1c-bdbf-3e98ef0b847f", "media https server failed: %v", serveErr)
 					fyne.Do(func() {
 						ui.mediaServerLabel.SetText(fmt.Sprintf("Media HTTP: %s | HTTPS: failed", ui.mediaHTTPBaseURL))
 					})
@@ -461,6 +472,10 @@ type trackedObjectDetail struct {
 	LastPositionY  int
 }
 
+type externalIPResponse struct {
+	IP string `json:"ip"`
+}
+
 type dwarfDownloadRequest struct {
 	controller         DwarfController
 	camera             string
@@ -551,6 +566,8 @@ const (
 	prefNostrEnabled        = "nostr.enabled"
 	prefNostrRelayURL       = "nostr.relay_url"
 	prefNostrSecretKey      = "nostr.secret_key"
+	prefNostrBlossomURL     = "nostr.blossom_url"
+	prefNostrBlossomNoteURL = "nostr.blossom_note_url"
 	prefNostrMinDistance    = "nostr.min_track_distance"
 	prefNostrUseObjectGIF   = "nostr.use_object_gif"
 	prefNostrTestMessage    = "nostr.test_message"
@@ -764,6 +781,10 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 	nostrRelayEntry.SetPlaceHolder("ws://127.0.0.1:7447")
 	nostrSecretEntry := widget.NewPasswordEntry()
 	nostrSecretEntry.SetPlaceHolder("nsec... or 64-char hex secret")
+	nostrBlossomEntry := widget.NewEntry()
+	nostrBlossomEntry.SetPlaceHolder("http://127.0.0.1:3000")
+	nostrBlossomNoteEntry := widget.NewEntry()
+	nostrBlossomNoteEntry.SetPlaceHolder("http://192.168.50.215:3000")
 	nostrMinDistanceEntry := widget.NewEntry()
 	nostrMinDistanceEntry.SetText("800")
 	nostrUseObjectGIFCheck := widget.NewCheck("Use object GIF instead of static picture in Nostr note", nil)
@@ -811,6 +832,8 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 		nostrEnableCheck:           nostrEnableCheck,
 		nostrRelayEntry:            nostrRelayEntry,
 		nostrSecretEntry:           nostrSecretEntry,
+		nostrBlossomEntry:          nostrBlossomEntry,
+		nostrBlossomNoteEntry:      nostrBlossomNoteEntry,
 		nostrMinDistanceEntry:      nostrMinDistanceEntry,
 		nostrUseObjectGIFCheck:     nostrUseObjectGIFCheck,
 		nostrTestMessageEntry:      nostrTestMessageEntry,
@@ -824,6 +847,8 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 		dwarfStatusLabel:           widget.NewLabel("DWARF idle"),
 		dwarfQueueLabel:            widget.NewLabel("DWARF queue: 0"),
 		mediaServerLabel:           widget.NewLabel("Media HTTP: starting..."),
+		externalIPLabel:            widget.NewLabel("External IP: loading..."),
+		intranetIPLabel:            widget.NewLabel("Intranet IP: loading..."),
 		playbackLabel:              playbackLabel,
 		historyInfo:                historyInfo,
 		historyDetail:              historyDetail,
@@ -874,6 +899,8 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 	ui.saveObjectNameButton = widget.NewButtonWithIcon("Save Name", theme.DocumentSaveIcon(), ui.saveSelectedObjectName)
 	ui.playPauseButton = widget.NewButtonWithIcon("Pause", theme.MediaPauseIcon(), ui.togglePlaybackPause)
 	ui.sendNostrTestButton = widget.NewButtonWithIcon("Send Test Note", theme.MailSendIcon(), ui.sendNostrTestNote)
+	ui.copyExternalIPButton = widget.NewButtonWithIcon("", theme.ContentCopyIcon(), ui.copyExternalIP)
+	ui.copyIntranetIPButton = widget.NewButtonWithIcon("", theme.ContentCopyIcon(), ui.copyIntranetIP)
 	ui.stopButton.Disable()
 	ui.stopDwarfButton.Disable()
 	ui.openTrackedButton.Disable()
@@ -887,6 +914,8 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 	ui.playPauseButton.Disable()
 	ui.finalPositionSlider.Disable()
 	ui.finalPositionDistanceEntry.Disable()
+	ui.copyExternalIPButton.Disable()
+	ui.copyIntranetIPButton.Disable()
 
 	ui.sourceRadio.OnChanged = func(string) {
 		ui.refreshSourceControls()
@@ -985,6 +1014,8 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 	ui.loadHistoryPreferences()
 	ui.refreshEventHistory()
 	ui.resetPlaybackControls()
+	ui.refreshExternalIP()
+	ui.refreshIntranetIP()
 
 	return ui
 }
@@ -1043,6 +1074,10 @@ func (ui *trackerApp) buildUI() fyne.CanvasObject {
 			ui.nostrEnableCheck,
 			container.NewBorder(nil, nil, widget.NewLabel("Relay URL"), nil, ui.nostrRelayEntry),
 			container.NewBorder(nil, nil, widget.NewLabel("Secret Key"), nil, ui.nostrSecretEntry),
+			container.NewBorder(nil, nil, widget.NewLabel("Blossom Upload Server"), nil, ui.nostrBlossomEntry),
+			container.NewBorder(nil, nil, widget.NewLabel("Blossom Note Base URL"), nil, ui.nostrBlossomNoteEntry),
+			container.NewBorder(nil, nil, widget.NewLabel("Current Intranet IP"), ui.copyIntranetIPButton, ui.intranetIPLabel),
+			container.NewBorder(nil, nil, widget.NewLabel("Current External IP"), ui.copyExternalIPButton, ui.externalIPLabel),
 			container.NewBorder(nil, nil, widget.NewLabel("Min Straight-Line Track Px"), nil, ui.nostrMinDistanceEntry),
 			ui.nostrUseObjectGIFCheck,
 			widget.NewLabel("Test Note"),
@@ -1177,6 +1212,196 @@ func (ui *trackerApp) refreshSourceControls() {
 	ui.fileEntry.Disable()
 	ui.fileButton.Disable()
 	ui.urlEntry.Enable()
+}
+
+func (ui *trackerApp) refreshExternalIP() {
+	go func() {
+		ip, err := fetchExternalIPv4()
+		fyne.Do(func() {
+			if err != nil {
+				ui.externalIP = ""
+				ui.externalIPLabel.SetText(fmt.Sprintf("External IP: unavailable (%v)", err))
+				ui.copyExternalIPButton.Disable()
+				return
+			}
+			ui.externalIP = ip
+			ui.externalIPLabel.SetText(fmt.Sprintf("External IP: %s", ip))
+			ui.copyExternalIPButton.Enable()
+		})
+	}()
+}
+
+func (ui *trackerApp) refreshIntranetIP() {
+	ip, err := fetchIntranetIPv4()
+	if err != nil {
+		ui.intranetIP = ""
+		ui.intranetIPLabel.SetText(fmt.Sprintf("Intranet IP: unavailable (%v)", err))
+		ui.copyIntranetIPButton.Disable()
+		return
+	}
+	ui.intranetIP = ip
+	ui.intranetIPLabel.SetText(fmt.Sprintf("Intranet IP: %s", ip))
+	ui.copyIntranetIPButton.Enable()
+	ui.refreshBlossomNoteBaseDefault()
+}
+
+func fetchExternalIPv4() (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.ipify.org/?format=json", nil)
+	if err != nil {
+		return "", fmt.Errorf("build request: %w", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("fetch: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("status %s", resp.Status)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	if err != nil {
+		return "", fmt.Errorf("read response: %w", err)
+	}
+
+	var payload externalIPResponse
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", fmt.Errorf("decode response: %w", err)
+	}
+
+	ip := strings.TrimSpace(payload.IP)
+	if net.ParseIP(ip) == nil {
+		return "", fmt.Errorf("invalid IP %q", ip)
+	}
+	return ip, nil
+}
+
+func fetchIntranetIPv4() (string, error) {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return "", fmt.Errorf("list interfaces: %w", err)
+	}
+
+	var fallback string
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ip := ipFromAddr(addr)
+			if ip == nil || ip.IsLoopback() {
+				continue
+			}
+			v4 := ip.To4()
+			if v4 == nil {
+				continue
+			}
+			text := v4.String()
+			if isPrivateIPv4(v4) {
+				return text, nil
+			}
+			if fallback == "" {
+				fallback = text
+			}
+		}
+	}
+
+	if fallback != "" {
+		return fallback, nil
+	}
+	return "", errors.New("no active IPv4 interface found")
+}
+
+func ipFromAddr(addr net.Addr) net.IP {
+	switch value := addr.(type) {
+	case *net.IPNet:
+		return value.IP
+	case *net.IPAddr:
+		return value.IP
+	default:
+		return nil
+	}
+}
+
+func isPrivateIPv4(ip net.IP) bool {
+	v4 := ip.To4()
+	if v4 == nil {
+		return false
+	}
+	switch {
+	case v4[0] == 10:
+		return true
+	case v4[0] == 172 && v4[1] >= 16 && v4[1] <= 31:
+		return true
+	case v4[0] == 192 && v4[1] == 168:
+		return true
+	default:
+		return false
+	}
+}
+
+func (ui *trackerApp) refreshBlossomNoteBaseDefault() {
+	if strings.TrimSpace(ui.nostrBlossomNoteEntry.Text) != "" {
+		return
+	}
+	derived := deriveBlossomNoteBaseURL(strings.TrimSpace(ui.nostrBlossomEntry.Text), strings.TrimSpace(ui.intranetIP))
+	if derived == "" {
+		return
+	}
+	ui.nostrBlossomNoteEntry.SetText(derived)
+}
+
+func deriveBlossomNoteBaseURL(uploadURL, intranetIP string) string {
+	intranetIP = strings.TrimSpace(intranetIP)
+	if intranetIP == "" {
+		return ""
+	}
+
+	parsed, err := url.Parse(strings.TrimSpace(uploadURL))
+	if err != nil {
+		return ""
+	}
+	if parsed.Scheme == "" {
+		parsed.Scheme = "http"
+	}
+	port := parsed.Port()
+	if port != "" {
+		parsed.Host = net.JoinHostPort(intranetIP, port)
+	} else {
+		parsed.Host = intranetIP
+	}
+	parsed.Path = ""
+	parsed.RawPath = ""
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return strings.TrimRight(parsed.String(), "/")
+}
+
+func (ui *trackerApp) copyExternalIP() {
+	ip := strings.TrimSpace(ui.externalIP)
+	if ip == "" {
+		return
+	}
+	ui.window.Clipboard().SetContent(ip)
+	ui.statusLabel.SetText(fmt.Sprintf("Copied external IP: %s", ip))
+}
+
+func (ui *trackerApp) copyIntranetIP() {
+	ip := strings.TrimSpace(ui.intranetIP)
+	if ip == "" {
+		return
+	}
+	ui.window.Clipboard().SetContent(ip)
+	ui.statusLabel.SetText(fmt.Sprintf("Copied intranet IP: %s", ip))
 }
 
 func (ui *trackerApp) pickVideoFile() {
@@ -2393,7 +2618,7 @@ func (ui *trackerApp) executeTracker(config TrackerConfig, stopCh <-chan struct{
 	err := engine.Run()
 	if err == nil && config.InputLabel == "video file" && config.Nostr.Enabled {
 		if publishErr := ui.publishCompletedVideoAnalysisNostrNote(savedEventDirs, config); publishErr != nil {
-			fmt.Fprintf(os.Stderr, "nostr publish failed for %s: %v\n", config.Input, publishErr)
+			applog.ErrorfID("d0941121-d265-454c-bf0e-a1b3d2f39bdd", "nostr publish failed input=%s error=%v", config.Input, publishErr)
 			ui.mu.Lock()
 			ui.pendingRunStatus = "Video analysis finished, but Nostr publish failed"
 			ui.pendingRunError = publishErr
@@ -3029,6 +3254,8 @@ func (ui *trackerApp) loadTrackingPreferences() {
 	ui.nostrEnableCheck.SetChecked(prefs.BoolWithFallback(prefNostrEnabled, false))
 	ui.nostrRelayEntry.SetText(prefs.StringWithFallback(prefNostrRelayURL, nostrutil.DefaultRelayURL))
 	ui.nostrSecretEntry.SetText(prefs.StringWithFallback(prefNostrSecretKey, ""))
+	ui.nostrBlossomEntry.SetText(prefs.StringWithFallback(prefNostrBlossomURL, nostrutil.DefaultBlossomServerURL))
+	ui.nostrBlossomNoteEntry.SetText(prefs.StringWithFallback(prefNostrBlossomNoteURL, ""))
 	ui.nostrMinDistanceEntry.SetText(prefs.StringWithFallback(prefNostrMinDistance, "800"))
 	ui.nostrUseObjectGIFCheck.SetChecked(prefs.BoolWithFallback(prefNostrUseObjectGIF, false))
 	nostrTestMessage := prefs.StringWithFallback(prefNostrTestMessage, "")
@@ -3059,6 +3286,8 @@ func (ui *trackerApp) saveTrackingPreferences() {
 	prefs.SetBool(prefNostrEnabled, ui.nostrEnableCheck.Checked)
 	prefs.SetString(prefNostrRelayURL, ui.nostrRelayEntry.Text)
 	prefs.SetString(prefNostrSecretKey, ui.nostrSecretEntry.Text)
+	prefs.SetString(prefNostrBlossomURL, ui.nostrBlossomEntry.Text)
+	prefs.SetString(prefNostrBlossomNoteURL, ui.nostrBlossomNoteEntry.Text)
 	prefs.SetString(prefNostrMinDistance, ui.nostrMinDistanceEntry.Text)
 	prefs.SetBool(prefNostrUseObjectGIF, ui.nostrUseObjectGIFCheck.Checked)
 	prefs.SetString(prefNostrTestMessage, ui.nostrTestMessageEntry.Text)
@@ -3225,11 +3454,19 @@ func (ui *trackerApp) buildTrackingSettings() (TrackingSettings, error) {
 
 func (ui *trackerApp) buildNostrSettings() (NostrSettings, error) {
 	settings := NostrSettings{
-		Enabled:      ui.nostrEnableCheck.Checked,
-		RelayURL:     strings.TrimSpace(ui.nostrRelayEntry.Text),
-		SecretKey:    strings.TrimSpace(ui.nostrSecretEntry.Text),
-		UseObjectGIF: ui.nostrUseObjectGIFCheck.Checked,
-		Timeout:      nostrutil.DefaultTimeout,
+		Enabled:          ui.nostrEnableCheck.Checked,
+		RelayURL:         strings.TrimSpace(ui.nostrRelayEntry.Text),
+		SecretKey:        strings.TrimSpace(ui.nostrSecretEntry.Text),
+		BlossomServerURL: strings.TrimSpace(ui.nostrBlossomEntry.Text),
+		BlossomNoteURL:   strings.TrimSpace(ui.nostrBlossomNoteEntry.Text),
+		UseObjectGIF:     ui.nostrUseObjectGIFCheck.Checked,
+		Timeout:          nostrutil.DefaultTimeout,
+	}
+	if settings.BlossomNoteURL == "" {
+		settings.BlossomNoteURL = deriveBlossomNoteBaseURL(settings.BlossomServerURL, strings.TrimSpace(ui.intranetIP))
+		if settings.BlossomNoteURL != "" {
+			ui.nostrBlossomNoteEntry.SetText(settings.BlossomNoteURL)
+		}
 	}
 
 	minDistanceText := strings.TrimSpace(ui.nostrMinDistanceEntry.Text)
@@ -3261,6 +3498,9 @@ func validateNostrSettings(settings NostrSettings, requirePublishConfig bool) er
 	}
 	if settings.SecretKey == "" {
 		return errors.New("Nostr secret key is required")
+	}
+	if settings.BlossomServerURL == "" {
+		return errors.New("Nostr Blossom media server URL is required")
 	}
 	if _, err := nostrutil.ResolveSecretKey(settings.SecretKey); err != nil {
 		return fmt.Errorf("invalid Nostr secret key: %w", err)
@@ -3295,7 +3535,8 @@ func (ui *trackerApp) sendNostrTestNote() {
 			SecretKey:        settings.SecretKey,
 			Timeout:          settings.Timeout,
 			Content:          content,
-			BlossomServerURL: nostrutil.DefaultBlossomServerURL,
+			BlossomServerURL: settings.BlossomServerURL,
+			BlossomNoteURL:   settings.BlossomNoteURL,
 		})
 
 		fyne.Do(func() {
@@ -3947,7 +4188,8 @@ func (ui *trackerApp) publishVideoAnalysisNostrNote(dir string, config TrackerCo
 		Timeout:          config.Nostr.Timeout,
 		Content:          content,
 		Tags:             tags,
-		BlossomServerURL: nostrutil.DefaultBlossomServerURL,
+		BlossomServerURL: config.Nostr.BlossomServerURL,
+		BlossomNoteURL:   config.Nostr.BlossomNoteURL,
 	})
 	if err != nil {
 		return fmt.Errorf("publish event note for %s with %d media tag(s): %w", dir, len(tags), err)
@@ -3957,13 +4199,14 @@ func (ui *trackerApp) publishVideoAnalysisNostrNote(dir string, config TrackerCo
 
 func (ui *trackerApp) publishCompletedVideoAnalysisNostrNote(eventDirs []string, config TrackerConfig) error {
 	completionContent := fmt.Sprintf("Finished processing video file: %s", filepath.Base(config.Input))
-	fmt.Fprintf(os.Stderr, "nostr publish completion input=%s event_count=%d relay=%s media_mode=%s\n", config.Input, len(eventDirs), config.Nostr.RelayURL, map[bool]string{true: "gif", false: "static"}[config.Nostr.UseObjectGIF])
+	applog.InfofID("94e57ea9-f697-4af6-8564-46c8c1f6ceee", "nostr publish completion input=%s event_count=%d relay=%s media_mode=%s", config.Input, len(eventDirs), config.Nostr.RelayURL, map[bool]string{true: "gif", false: "static"}[config.Nostr.UseObjectGIF])
 	if _, err := nostrutil.PublishTextNote(context.Background(), nostrutil.PublishOptions{
 		RelayURL:         config.Nostr.RelayURL,
 		SecretKey:        config.Nostr.SecretKey,
 		Timeout:          config.Nostr.Timeout,
 		Content:          completionContent,
-		BlossomServerURL: nostrutil.DefaultBlossomServerURL,
+		BlossomServerURL: config.Nostr.BlossomServerURL,
+		BlossomNoteURL:   config.Nostr.BlossomNoteURL,
 	}); err != nil {
 		return fmt.Errorf("publish completion note for %s: %w", config.Input, err)
 	}
@@ -3979,7 +4222,8 @@ func (ui *trackerApp) publishCompletedVideoAnalysisNostrNote(eventDirs []string,
 			SecretKey:        config.Nostr.SecretKey,
 			Timeout:          config.Nostr.Timeout,
 			Content:          content,
-			BlossomServerURL: nostrutil.DefaultBlossomServerURL,
+			BlossomServerURL: config.Nostr.BlossomServerURL,
+			BlossomNoteURL:   config.Nostr.BlossomNoteURL,
 		})
 		if err != nil {
 			return fmt.Errorf("publish no-events note for %s: %w", config.Input, err)
@@ -4017,14 +4261,15 @@ func (ui *trackerApp) publishCompletedVideoAnalysisNostrNote(eventDirs []string,
 	}
 
 	dedupedTags := dedupeNostrTags(tags)
-	fmt.Fprintf(os.Stderr, "nostr publish aggregate input=%s aggregate_tag_count=%d media_paths=%v\n", config.Input, len(dedupedTags), nostrTagValues(dedupedTags))
+	applog.InfofID("1ece86db-709d-4631-a704-14d2b651e4bf", "nostr publish aggregate input=%s aggregate_tag_count=%d media_paths=%v", config.Input, len(dedupedTags), nostrTagValues(dedupedTags))
 	_, err := nostrutil.PublishTextNote(context.Background(), nostrutil.PublishOptions{
 		RelayURL:         config.Nostr.RelayURL,
 		SecretKey:        config.Nostr.SecretKey,
 		Timeout:          config.Nostr.Timeout,
 		Content:          strings.Join(lines, "\n"),
 		Tags:             dedupedTags,
-		BlossomServerURL: nostrutil.DefaultBlossomServerURL,
+		BlossomServerURL: config.Nostr.BlossomServerURL,
+		BlossomNoteURL:   config.Nostr.BlossomNoteURL,
 	})
 	if err != nil {
 		return fmt.Errorf("publish aggregate note for %s with %d media tag(s): %w", config.Input, len(dedupedTags), err)
@@ -4483,7 +4728,7 @@ func (ui *trackerApp) representativeObjectMediaPath(object trackedObjectDetail, 
 		if objectDir != "" {
 			gifPath, err := ensureObjectGIF(objectDir)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "nostr gif generation failed object_id=%d object_dir=%s: %v\n", object.ID, objectDir, err)
+				applog.ErrorfID("e8f93d88-c332-46c7-b3df-4843f203d4ee", "nostr gif generation failed object_id=%d object_dir=%s error=%v", object.ID, objectDir, err)
 			} else if gifPath != "" {
 				return gifPath
 			}
