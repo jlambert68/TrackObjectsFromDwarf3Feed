@@ -4298,7 +4298,7 @@ func (ui *trackerApp) formatNostrEventSummary(detail eventHistoryDetail, config 
 
 	objectLines := make([]string, 0, len(qualified))
 	for _, object := range qualified {
-		lineParts := []string{fmt.Sprintf("#%04d", object.ID)}
+		lineParts := []string{fmt.Sprintf("Object %04d", object.ID)}
 		if mediaPath := ui.representativeObjectMediaPath(object, config.Nostr.UseObjectGIF); mediaPath != "" {
 			lineParts = append(lineParts, mediaPath)
 		}
