@@ -53,6 +53,54 @@ func logErrorWithContext(prefix string, err error) {
 	}
 }
 
+type trackerTheme struct {
+	base fyne.Theme
+}
+
+func (t trackerTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) color.Color {
+	switch name {
+	case theme.ColorNamePrimary:
+		return color.NRGBA{R: 0x3d, G: 0xc7, B: 0x89, A: 0xff}
+	case theme.ColorNameBackground:
+		return color.NRGBA{R: 0x12, G: 0x14, B: 0x16, A: 0xff}
+	case theme.ColorNameButton:
+		return color.NRGBA{R: 0x24, G: 0x28, B: 0x2c, A: 0xff}
+	case theme.ColorNameInputBackground:
+		return color.NRGBA{R: 0x1a, G: 0x1d, B: 0x20, A: 0xff}
+	case theme.ColorNameSeparator:
+		return color.NRGBA{R: 0x35, G: 0x3b, B: 0x40, A: 0xff}
+	case theme.ColorNameHover:
+		return color.NRGBA{R: 0x2d, G: 0x37, B: 0x3a, A: 0xff}
+	case theme.ColorNameFocus:
+		return color.NRGBA{R: 0x35, G: 0x8f, B: 0x72, A: 0xff}
+	}
+	return t.base.Color(name, variant)
+}
+
+func (t trackerTheme) Font(style fyne.TextStyle) fyne.Resource {
+	return t.base.Font(style)
+}
+
+func (t trackerTheme) Icon(name fyne.ThemeIconName) fyne.Resource {
+	return t.base.Icon(name)
+}
+
+func (t trackerTheme) Size(name fyne.ThemeSizeName) float32 {
+	switch name {
+	case theme.SizeNamePadding:
+		return 8
+	case theme.SizeNameInnerPadding:
+		return 7
+	case theme.SizeNameText:
+		return 13
+	case theme.SizeNameHeadingText:
+		return 18
+	case theme.SizeNameSubHeadingText:
+		return 15
+	}
+	return t.base.Size(name)
+}
+
 type trackerApp struct {
 	window fyne.Window
 
@@ -608,6 +656,7 @@ func (e eventHistoryEntry) subtitle() string {
 
 func main() {
 	application := app.NewWithID(appID)
+	application.Settings().SetTheme(trackerTheme{base: theme.DarkTheme()})
 	window := application.NewWindow("DWARF 3 Fast Object Tracker")
 	window.Resize(fyne.NewSize(1360, 860))
 
@@ -901,6 +950,11 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 	ui.sendNostrTestButton = widget.NewButtonWithIcon("Send Test Note", theme.MailSendIcon(), ui.sendNostrTestNote)
 	ui.copyExternalIPButton = widget.NewButtonWithIcon("", theme.ContentCopyIcon(), ui.copyExternalIP)
 	ui.copyIntranetIPButton = widget.NewButtonWithIcon("", theme.ContentCopyIcon(), ui.copyIntranetIP)
+	ui.startButton.Importance = widget.HighImportance
+	ui.stopButton.Importance = widget.DangerImportance
+	ui.startDwarfButton.Importance = widget.HighImportance
+	ui.stopDwarfButton.Importance = widget.DangerImportance
+	ui.deletePresetButton.Importance = widget.DangerImportance
 	ui.stopButton.Disable()
 	ui.stopDwarfButton.Disable()
 	ui.openTrackedButton.Disable()
@@ -1021,102 +1075,113 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 }
 
 func (ui *trackerApp) buildUI() fyne.CanvasObject {
-	sourceRow := container.NewVBox(
-		widget.NewLabelWithStyle("Source", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		ui.sourceRadio,
+	ui.statusLabel.Wrapping = fyne.TextWrapWord
+	ui.eventLabel.Wrapping = fyne.TextWrapWord
+	ui.mediaServerLabel.Wrapping = fyne.TextWrapWord
+	ui.dwarfStatusLabel.Wrapping = fyne.TextWrapWord
+	ui.dwarfQueueLabel.Wrapping = fyne.TextWrapWord
+
+	sourceForm := widget.NewForm(
+		widget.NewFormItem("Source", ui.sourceRadio),
+		widget.NewFormItem("RTSP URL", ui.urlEntry),
+		widget.NewFormItem("Video File", container.NewBorder(nil, nil, nil, ui.fileButton, ui.fileEntry)),
+		widget.NewFormItem("Output Dir", container.NewBorder(nil, nil, nil, ui.outputButton, ui.outputEntry)),
+		widget.NewFormItem("Fallback FPS", ui.fpsEntry),
 	)
+	sourceSection := uiSection("Input", container.NewVBox(sourceForm, ui.showMask))
 
-	urlRow := container.NewBorder(nil, nil, widget.NewLabel("RTSP URL"), nil, ui.urlEntry)
-	fileRow := container.NewBorder(nil, nil, widget.NewLabel("Video File"), ui.fileButton, ui.fileEntry)
-	outputRow := container.NewBorder(nil, nil, widget.NewLabel("Output Dir"), ui.outputButton, ui.outputEntry)
-	dwarfHostRow := container.NewBorder(nil, nil, widget.NewLabel("Dwarf Host"), nil, ui.dwarfHostEntry)
-	dwarfCameraRow := container.NewBorder(nil, nil, widget.NewLabel("Dwarf Camera"), nil, ui.dwarfCameraSelect)
-	dwarfSegmentRow := container.NewBorder(nil, nil, widget.NewLabel("Dwarf Segment Seconds"), nil, ui.dwarfSegmentEntry)
-	dwarfDownloadRow := container.NewBorder(nil, nil, widget.NewLabel("Dwarf Download Dir"), ui.dwarfDownloadButton, ui.dwarfDownloadDirEntry)
-
-	options := container.NewHBox(
-		widget.NewLabel("Fallback FPS"),
-		ui.fpsEntry,
-		ui.showMask,
+	dwarfForm := widget.NewForm(
+		widget.NewFormItem("Host", ui.dwarfHostEntry),
+		widget.NewFormItem("Camera", ui.dwarfCameraSelect),
+		widget.NewFormItem("Segment Seconds", ui.dwarfSegmentEntry),
+		widget.NewFormItem("Download Dir", container.NewBorder(nil, nil, nil, ui.dwarfDownloadButton, ui.dwarfDownloadDirEntry)),
 	)
-
-	trackingSettings := widget.NewAccordion(
-		widget.NewAccordionItem("Tracking Parameters", container.NewVBox(
-			container.NewHBox(ui.resetTrackingButton, ui.importTrackingButton, ui.exportTrackingButton),
-			container.NewBorder(nil, nil, widget.NewLabel("Preset"), nil, ui.presetSelect),
-			container.NewBorder(nil, nil, widget.NewLabel("Preset Name"), nil, ui.presetNameEntry),
-			container.NewHBox(ui.savePresetButton, ui.applyPresetButton, ui.deletePresetButton),
-			container.NewGridWithColumns(2,
-				container.NewBorder(nil, nil, widget.NewLabel("Tracking Profile"), nil, ui.profileSelect),
-				widget.NewLabel(""),
-				container.NewBorder(nil, nil, widget.NewLabel("Min Area"), nil, ui.minAreaEntry),
-				container.NewBorder(nil, nil, widget.NewLabel("Max Area"), nil, ui.maxAreaEntry),
-				container.NewBorder(nil, nil, widget.NewLabel("Slow Min Speed"), nil, ui.slowSpeedEntry),
-				container.NewBorder(nil, nil, widget.NewLabel("Fast Min Speed"), nil, ui.minSpeedEntry),
-				container.NewBorder(nil, nil, widget.NewLabel("Match Distance"), nil, ui.matchDistanceEntry),
-				container.NewBorder(nil, nil, widget.NewLabel("Min Hits"), nil, ui.minHitsEntry),
-				container.NewBorder(nil, nil, widget.NewLabel("Blur Size"), nil, ui.blurSizeEntry),
-				container.NewBorder(nil, nil, widget.NewLabel("Foreground Threshold"), nil, ui.foregroundThresholdEntry),
-				container.NewBorder(nil, nil, widget.NewLabel("Pre Event Seconds"), nil, ui.preEventEntry),
-				container.NewBorder(nil, nil, widget.NewLabel("Post Event Seconds"), nil, ui.postEventEntry),
-				container.NewBorder(nil, nil, widget.NewLabel("Raw Segment Seconds"), nil, ui.rawSegmentEntry),
-				container.NewBorder(nil, nil, widget.NewLabel("Raw Segment Overlap Seconds"), nil, ui.rawSegmentOverlapEntry),
-				container.NewBorder(nil, nil, widget.NewLabel("MOG2 History"), nil, ui.mog2HistoryEntry),
-				container.NewBorder(nil, nil, widget.NewLabel("MOG2 Var Threshold"), nil, ui.mog2VarThresholdEntry),
-				container.NewBorder(nil, nil, widget.NewLabel("ROI Height Fraction"), nil, ui.roiHeightEntry),
-			),
-			ui.generateObjectGIFsCheck,
-		)),
+	dwarfActions := container.NewGridWithColumns(2,
+		ui.startDwarfButton,
+		ui.stopDwarfButton,
+		ui.fetchDwarfButton,
+		ui.testDwarfButton,
+		ui.testDwarfRecordButton,
+		ui.rawDwarfWSButton,
+		ui.sessionProbeButton,
 	)
-
-	nostrSettings := widget.NewAccordion(
-		widget.NewAccordionItem("Nostr Settings", container.NewVBox(
-			ui.nostrEnableCheck,
-			container.NewBorder(nil, nil, widget.NewLabel("Relay URL"), nil, ui.nostrRelayEntry),
-			container.NewBorder(nil, nil, widget.NewLabel("Secret Key"), nil, ui.nostrSecretEntry),
-			container.NewBorder(nil, nil, widget.NewLabel("Blossom Upload Server"), nil, ui.nostrBlossomEntry),
-			container.NewBorder(nil, nil, widget.NewLabel("Blossom Note Base URL"), nil, ui.nostrBlossomNoteEntry),
-			container.NewBorder(nil, nil, widget.NewLabel("Current Intranet IP"), ui.copyIntranetIPButton, ui.intranetIPLabel),
-			container.NewBorder(nil, nil, widget.NewLabel("Current External IP"), ui.copyExternalIPButton, ui.externalIPLabel),
-			container.NewBorder(nil, nil, widget.NewLabel("Min Straight-Line Track Px"), nil, ui.nostrMinDistanceEntry),
-			ui.nostrUseObjectGIFCheck,
-			widget.NewLabel("Test Note"),
-			ui.nostrTestMessageEntry,
-			container.NewHBox(ui.sendNostrTestButton),
-		)),
-	)
-
 	dwarfCapture := widget.NewAccordion(
-		widget.NewAccordionItem("Dwarf Capture", container.NewVBox(
-			dwarfHostRow,
-			dwarfCameraRow,
-			dwarfSegmentRow,
-			dwarfDownloadRow,
-			ui.dwarfDeleteCheck,
-			ui.dwarfDebugWSCheck,
-			container.NewHBox(ui.startDwarfButton, ui.stopDwarfButton, ui.fetchDwarfButton, ui.testDwarfButton, ui.testDwarfRecordButton),
-			container.NewHBox(ui.rawDwarfWSButton, ui.sessionProbeButton),
+		widget.NewAccordionItem("Connection & Recording", container.NewVBox(
+			dwarfForm,
+			container.NewGridWithColumns(2, ui.dwarfDeleteCheck, ui.dwarfDebugWSCheck),
+			dwarfActions,
+			widget.NewSeparator(),
 			ui.dwarfStatusLabel,
 			ui.dwarfQueueLabel,
 		)),
 	)
 
-	actions := container.NewHBox(ui.startButton, ui.stopButton)
-
-	controls := container.NewVBox(
-		sourceRow,
-		urlRow,
-		fileRow,
-		outputRow,
-		options,
-		dwarfCapture,
-		trackingSettings,
-		nostrSettings,
-		actions,
+	trackingSettings := widget.NewAccordion(
+		widget.NewAccordionItem("Parameters", container.NewVBox(
+			container.NewGridWithColumns(3, ui.resetTrackingButton, ui.importTrackingButton, ui.exportTrackingButton),
+			widget.NewForm(
+				widget.NewFormItem("Preset", ui.presetSelect),
+				widget.NewFormItem("Preset Name", ui.presetNameEntry),
+			),
+			container.NewGridWithColumns(3, ui.savePresetButton, ui.applyPresetButton, ui.deletePresetButton),
+			widget.NewForm(
+				widget.NewFormItem("Profile", ui.profileSelect),
+			),
+			container.NewGridWithColumns(2,
+				settingField("Min Area", ui.minAreaEntry),
+				settingField("Max Area", ui.maxAreaEntry),
+				settingField("Slow Speed", ui.slowSpeedEntry),
+				settingField("Fast Speed", ui.minSpeedEntry),
+				settingField("Match Dist", ui.matchDistanceEntry),
+				settingField("Min Hits", ui.minHitsEntry),
+				settingField("Blur Size", ui.blurSizeEntry),
+				settingField("Threshold", ui.foregroundThresholdEntry),
+				settingField("Pre Event", ui.preEventEntry),
+				settingField("Post Event", ui.postEventEntry),
+				settingField("Segment", ui.rawSegmentEntry),
+				settingField("Overlap", ui.rawSegmentOverlapEntry),
+				settingField("MOG2 History", ui.mog2HistoryEntry),
+				settingField("MOG2 Var", ui.mog2VarThresholdEntry),
+				settingField("ROI Height", ui.roiHeightEntry),
+			),
+			ui.generateObjectGIFsCheck,
+		)),
 	)
+	trackingSection := uiSection("Tracking", trackingSettings)
 
-	statusBar := container.NewVBox(
-		widget.NewSeparator(),
+	nostrSettings := widget.NewAccordion(
+		widget.NewAccordionItem("Nostr", container.NewVBox(
+			ui.nostrEnableCheck,
+			widget.NewForm(
+				widget.NewFormItem("Relay URL", ui.nostrRelayEntry),
+				widget.NewFormItem("Secret Key", ui.nostrSecretEntry),
+				widget.NewFormItem("Upload Server", ui.nostrBlossomEntry),
+				widget.NewFormItem("Note Base URL", ui.nostrBlossomNoteEntry),
+				widget.NewFormItem("Min Track Px", ui.nostrMinDistanceEntry),
+			),
+			container.NewGridWithColumns(1,
+				container.NewBorder(nil, nil, widget.NewLabel("Intranet IP"), ui.copyIntranetIPButton, ui.intranetIPLabel),
+				container.NewBorder(nil, nil, widget.NewLabel("External IP"), ui.copyExternalIPButton, ui.externalIPLabel),
+			),
+			ui.nostrUseObjectGIFCheck,
+			widget.NewLabel("Test Note"),
+			ui.nostrTestMessageEntry,
+			container.NewGridWithColumns(1, ui.sendNostrTestButton),
+		)),
+	)
+	nostrSection := uiSection("Sharing", nostrSettings)
+
+	runSection := uiSection("Run", container.NewGridWithColumns(2, ui.startButton, ui.stopButton))
+	controls := container.NewScroll(container.NewPadded(container.NewVBox(
+		sourceSection,
+		uiSection("Camera", dwarfCapture),
+		trackingSection,
+		nostrSection,
+		runSection,
+	)))
+	controls.SetMinSize(fyne.NewSize(390, 0))
+
+	statusBar := uiStatusBar(
 		ui.mediaServerLabel,
 		ui.statusLabel,
 		ui.eventLabel,
@@ -1130,74 +1195,97 @@ func (ui *trackerApp) buildUI() fyne.CanvasObject {
 		ui.playbackSlider,
 	)
 
+	trackedTitle := widget.NewLabelWithStyle("Tracked Replay", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	mapTitle := widget.NewLabelWithStyle("Object Map", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 	trackedPanel := container.NewHSplit(
-		container.NewBorder(
-			widget.NewLabelWithStyle("Tracked Replay", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-			playbackControls,
-			nil,
-			nil,
-			container.NewPadded(ui.videoImage),
-		),
-		container.NewBorder(
-			widget.NewLabelWithStyle("Object Map", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-			nil,
-			nil,
-			nil,
-			container.NewPadded(ui.objectMapImage),
-		),
+		container.NewPadded(container.NewBorder(trackedTitle, playbackControls, nil, nil, ui.videoImage)),
+		container.NewPadded(container.NewBorder(mapTitle, nil, nil, nil, ui.objectMapImage)),
 	)
 	trackedPanel.Offset = 0.5
-	trackedTab := container.NewTabItem("Tracked", trackedPanel)
-	maskTab := container.NewTabItem("Mask", container.NewPadded(ui.maskImage))
+	trackedTab := container.NewTabItemWithIcon("Replay", theme.MediaPlayIcon(), trackedPanel)
+	maskTab := container.NewTabItemWithIcon("Mask", theme.VisibilityIcon(), container.NewPadded(ui.maskImage))
 	ui.tabs = container.NewAppTabs(trackedTab, maskTab)
+	ui.tabs.SetTabLocation(container.TabLocationTop)
 
-	historyHeader := container.NewBorder(nil, nil, widget.NewLabelWithStyle("Event History", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}), ui.refreshButton)
-	historyActions := container.NewHBox(ui.openTrackedButton, ui.openOriginalButton, ui.restoreSettingsButton)
-	objectActions := container.NewHBox(
+	historyHeader := container.NewBorder(nil, nil, sectionTitle("Event History"), ui.refreshButton)
+	historyActions := container.NewGridWithColumns(3, ui.openTrackedButton, ui.openOriginalButton, ui.restoreSettingsButton)
+	objectActions := container.NewGridWithColumns(2,
 		ui.watchObjectButton,
 		ui.showFinalPositionsButton,
-		widget.NewLabel("Skip"),
-		ui.objectMapSkipEntry,
 		ui.saveObjectNameButton,
+		container.NewBorder(nil, nil, widget.NewLabel("Skip"), nil, ui.objectMapSkipEntry),
 	)
 	finalPositionControls := container.NewVBox(
-		widget.NewLabelWithStyle("Final Position Filter", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		sectionTitle("Final Position Filter"),
 		container.NewBorder(nil, nil, widget.NewLabel("Min Travel"), nil, ui.finalPositionSlider),
 		container.NewBorder(nil, nil, widget.NewLabel("Min Travel Px"), nil, ui.finalPositionDistanceEntry),
 	)
-	filterRow := container.NewGridWithColumns(1,
-		container.NewBorder(nil, nil, widget.NewLabel("Date"), nil, ui.dateFilter),
-		container.NewBorder(nil, nil, widget.NewLabel("Min Objects"), nil, ui.objectFilter),
-		container.NewBorder(nil, nil, widget.NewLabel("Min Peak Speed"), nil, ui.speedFilter),
-		container.NewBorder(nil, nil, widget.NewLabel("Sort"), nil, ui.sortSelect),
+	filterRow := widget.NewForm(
+		widget.NewFormItem("Date", ui.dateFilter),
+		widget.NewFormItem("Min Objects", ui.objectFilter),
+		widget.NewFormItem("Min Peak Speed", ui.speedFilter),
+		widget.NewFormItem("Sort", ui.sortSelect),
 	)
 	ui.historyDetail.SetMinRowsVisible(14)
 	ui.objectDetail.SetMinRowsVisible(10)
 	objectPreviewPanel := container.NewBorder(
-		widget.NewLabelWithStyle("Object View", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		sectionTitle("Object View"),
 		nil,
 		nil,
 		nil,
 		ui.objectImage,
 	)
 	objectInfoPanel := container.NewVBox(
-		widget.NewLabelWithStyle("Tracked Object", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		container.NewBorder(nil, nil, widget.NewLabel("Find Object ID"), nil, ui.objectSearchEntry),
+		sectionTitle("Tracked Object"),
+		widget.NewForm(widget.NewFormItem("Find ID", ui.objectSearchEntry)),
 		ui.objectList,
-		container.NewBorder(nil, nil, widget.NewLabel("Name"), nil, ui.objectName),
+		widget.NewForm(widget.NewFormItem("Name", ui.objectName)),
 		objectActions,
 		finalPositionControls,
 		ui.objectDetail,
 	)
 	objectPanel := container.NewHSplit(objectInfoPanel, container.NewPadded(objectPreviewPanel))
 	objectPanel.Offset = 0.62
-	historyTop := container.NewVBox(historyHeader, filterRow, historyActions, ui.historyInfo, ui.historyDetail, objectPanel)
-	historyPanel := container.NewBorder(historyTop, nil, nil, nil, ui.historyList)
-	mainPanel := container.NewBorder(controls, statusBar, nil, nil, ui.tabs)
+	historyInspector := container.NewVBox(
+		historyHeader,
+		uiSection("Filters", filterRow),
+		historyActions,
+		ui.historyInfo,
+		ui.historyDetail,
+		uiSection("Objects", objectPanel),
+	)
+	historyInspectorScroll := container.NewScroll(container.NewPadded(historyInspector))
+	historyInspectorScroll.SetMinSize(fyne.NewSize(360, 320))
+	historyPanel := container.NewVSplit(uiSection("Events", ui.historyList), historyInspectorScroll)
+	historyPanel.Offset = 0.34
+	workbench := container.NewHSplit(controls, ui.tabs)
+	workbench.Offset = 0.30
+	mainPanel := container.NewBorder(nil, statusBar, nil, nil, workbench)
 	content := container.NewHSplit(mainPanel, container.NewPadded(historyPanel))
-	content.Offset = 0.76
+	content.Offset = 0.72
 
 	return content
+}
+
+func uiSection(title string, content fyne.CanvasObject) fyne.CanvasObject {
+	return widget.NewCard(title, "", container.NewPadded(content))
+}
+
+func sectionTitle(text string) *widget.Label {
+	return widget.NewLabelWithStyle(text, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+}
+
+func settingField(label string, entry *widget.Entry) fyne.CanvasObject {
+	return container.NewBorder(nil, nil, widget.NewLabel(label), nil, entry)
+}
+
+func uiStatusBar(labels ...*widget.Label) fyne.CanvasObject {
+	items := make([]fyne.CanvasObject, 0, len(labels)+1)
+	items = append(items, widget.NewSeparator())
+	for _, label := range labels {
+		items = append(items, label)
+	}
+	return container.NewPadded(container.NewVBox(items...))
 }
 
 func (ui *trackerApp) refreshSourceControls() {

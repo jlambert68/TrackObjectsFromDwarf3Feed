@@ -1453,7 +1453,7 @@ func (c *ftpClient) readResponse(command string, expected ...int) (int, string, 
 		return code, msg, &ftpError{Command: command, Code: code, Message: msg, Err: err}
 	}
 	for _, candidate := range expected[1:] {
-		if strings.HasPrefix(msg, strconv.Itoa(candidate)) || code == candidate {
+		if code == candidate {
 			return code, msg, nil
 		}
 	}

@@ -1216,7 +1216,7 @@ func (c *dwarfFTPClient) readResponse(command string, expected ...int) (int, str
 	}
 
 	for _, candidate := range expected[1:] {
-		if strings.HasPrefix(msg, strconv.Itoa(candidate)) || code == candidate {
+		if code == candidate {
 			return code, msg, nil
 		}
 	}

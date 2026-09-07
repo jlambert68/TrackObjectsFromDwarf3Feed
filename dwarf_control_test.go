@@ -1,9 +1,32 @@
 package main
 
 import (
+	"bytes"
+	"io"
+	"net/textproto"
+	"strings"
 	"testing"
 	"time"
 )
+
+type testReadWriteCloser struct {
+	reader *strings.Reader
+	writer bytes.Buffer
+}
+
+func (c *testReadWriteCloser) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
+}
+
+func (c *testReadWriteCloser) Write(p []byte) (int, error) {
+	return c.writer.Write(p)
+}
+
+func (c *testReadWriteCloser) Close() error {
+	return nil
+}
+
+var _ io.ReadWriteCloser = (*testReadWriteCloser)(nil)
 
 func TestParsePASVResponse(t *testing.T) {
 	host, port, err := parsePASVResponse("Entering Passive Mode (192,168,88,1,195,44)")
@@ -66,6 +89,22 @@ func TestDefaultDwarfControllerUsesVideosRoot(t *testing.T) {
 	controller := DefaultDwarfController()
 	if controller.FTPRoot != "/Videos" {
 		t.Fatalf("unexpected default dwarf ftp root: %s", controller.FTPRoot)
+	}
+}
+
+func TestDwarfFTPReadResponseDoesNotMatchExpectedCodeInMessage(t *testing.T) {
+	conn := &testReadWriteCloser{reader: strings.NewReader("500 331 login required\r\n")}
+
+	client := &dwarfFTPClient{
+		ctrl:    textproto.NewConn(conn),
+		timeout: time.Second,
+	}
+	code, msg, err := client.readResponse("USER anonymous", 230, 331)
+	if err == nil {
+		t.Fatalf("readResponse accepted code %d with message %q", code, msg)
+	}
+	if code != 500 {
+		t.Fatalf("unexpected response code: %d", code)
 	}
 }
 
