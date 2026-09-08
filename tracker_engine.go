@@ -23,6 +23,7 @@ type TrackerConfig struct {
 	FallbackFPS  float64
 	Settings     TrackingSettings
 	Nostr        NostrSettings
+	Capture      CaptureMetadata
 }
 
 type NostrSettings struct {
@@ -108,12 +109,7 @@ type TrackerEngine struct {
 }
 
 func (e *TrackerEngine) effectiveSettings() TrackingSettings {
-	settings := NormalizeTrackingSettings(e.Config.Settings)
-	if e.Config.InputLabel == "DWARF 3 live stream" {
-		settings.PreEventDuration = 3 * time.Second
-		settings.PostEventDuration = 3 * time.Second
-	}
-	return settings
+	return NormalizeTrackingSettings(e.Config.Settings)
 }
 
 func (e *TrackerEngine) shouldRecordEvents() bool {
@@ -122,7 +118,7 @@ func (e *TrackerEngine) shouldRecordEvents() bool {
 
 // Run executes the tracker until the input ends, the caller asks it to stop,
 // or an error occurs.
-func (e *TrackerEngine) Run() error {
+func (e *TrackerEngine) Run() (runErr error) {
 	if e.stopped() {
 		return nil
 	}
@@ -150,19 +146,18 @@ func (e *TrackerEngine) Run() error {
 	defer mask.Close()
 	cleanMask := gocv.NewMat()
 	defer cleanMask.Close()
+	settings := e.effectiveSettings()
 
 	// Disable MOG2 shadow labeling so moving objects darker than the background
 	// are still emitted as full foreground instead of being downgraded to the
 	// intermediate "shadow" class and discarded by the later binary threshold.
-	background := gocv.NewBackgroundSubtractorMOG2WithParams(e.Config.Settings.MOG2History, e.Config.Settings.MOG2VarThreshold, false)
+	background := gocv.NewBackgroundSubtractorMOG2WithParams(settings.MOG2History, settings.MOG2VarThreshold, false)
 	defer background.Close()
 
 	openKernel := gocv.GetStructuringElement(gocv.MorphEllipse, image.Pt(3, 3))
 	defer openKernel.Close()
 	dilateKernel := gocv.GetStructuringElement(gocv.MorphEllipse, image.Pt(5, 5))
 	defer dilateKernel.Close()
-	settings := e.effectiveSettings()
-
 	var tracks []*Track
 	var buffer []BufferedFrame
 	var recorder *EventRecorder
@@ -172,16 +167,15 @@ func (e *TrackerEngine) Run() error {
 		return fmt.Errorf("create frame spool directory: %w", err)
 	}
 	defer os.RemoveAll(bufferDir)
+
+	lastFrameTime := time.Time{}
 	defer func() {
-		if segmentRecorder != nil {
-			_ = segmentRecorder.Close()
-		}
+		runErr = errors.Join(runErr, finishTrackerRunResources(buffer, recorder, segmentRecorder, lastFrameTime))
 	}()
 
 	nextTrackID := 1
 	sourceFrame := 0
 	firstFrameTime := time.Time{}
-	lastFrameTime := time.Now()
 	lastInteresting := time.Time{}
 
 	for {
@@ -196,21 +190,18 @@ func (e *TrackerEngine) Run() error {
 			continue
 		}
 
-		now := time.Now()
+		observedAt := time.Now()
 		if firstFrameTime.IsZero() {
-			firstFrameTime = now
-		}
-
-		frameDT := now.Sub(lastFrameTime).Seconds()
-		lastFrameTime = now
-		if frameDT <= 0 || frameDT > 1 {
-			frameDT = 1.0 / fps
+			firstFrameTime = observedAt
 		}
 
 		sourceFrame++
+		now := sourceFrameTimestamp(e.Config.InputLabel, firstFrameTime, observedAt, sourceFrame, fps)
+		frameDT := sourceFrameDelta(lastFrameTime, now, fps)
+		lastFrameTime = now
 
 		if e.shouldRecordEvents() && segmentRecorder == nil && settings.RawSegmentDuration > 0 {
-			segmentRecorder, err = startRawSegmentRecorder(e.Config.OutputDir, fps, frame.Cols(), frame.Rows(), settings)
+			segmentRecorder, err = startRawSegmentRecorder(e.Config.OutputDir, fps, frame.Cols(), frame.Rows(), settings, e.Config.Capture)
 			if err != nil {
 				return err
 			}
@@ -248,6 +239,8 @@ func (e *TrackerEngine) Run() error {
 		tracks = filterTracksToROI(tracks, trackingROI)
 
 		meta := makeFrameMetadata(sourceFrame, firstFrameTime, now, tracks, settings)
+		mean := frame.Mean()
+		meta.MeanLuma = 0.114*mean.Val1 + 0.587*mean.Val2 + 0.299*mean.Val3
 		interesting := hasFreshInterestingTracks(tracks, settings)
 
 		if interesting {
@@ -260,16 +253,14 @@ func (e *TrackerEngine) Run() error {
 		} else if recorder == nil {
 			bufferedFrame, err := spoolBufferedFrame(frame, cleanMask, bufferDir, meta, now)
 			if err != nil {
-				closeBuffer(buffer)
 				return err
 			}
 			buffer = append(buffer, bufferedFrame)
 			buffer = trimBuffer(buffer, now.Add(-settings.PreEventDuration))
 
 			if interesting {
-				recorder, err = startEvent(e.Config.OutputDir, fps, frame.Cols(), frame.Rows(), buffer, settings)
+				recorder, err = startEvent(e.Config.OutputDir, fps, frame.Cols(), frame.Rows(), buffer, settings, e.Config.Capture)
 				if err != nil {
-					closeBuffer(buffer)
 					return err
 				}
 				closeBuffer(buffer)
@@ -289,10 +280,11 @@ func (e *TrackerEngine) Run() error {
 
 			if !lastInteresting.IsZero() && now.Sub(lastInteresting) >= settings.PostEventDuration {
 				dir := recorder.Directory
-				if err := recorder.Finish(now); err != nil {
+				finishedRecorder := recorder
+				recorder = nil
+				if err := finishedRecorder.Finish(now); err != nil {
 					return err
 				}
-				recorder = nil
 				lastInteresting = time.Time{}
 
 				if err := e.emitEventSaved(dir); err != nil {
@@ -319,11 +311,11 @@ func (e *TrackerEngine) Run() error {
 		}
 	}
 
-	closeBuffer(buffer)
-
 	if recorder != nil {
 		dir := recorder.Directory
-		if err := recorder.Finish(time.Now()); err != nil {
+		finishedRecorder := recorder
+		recorder = nil
+		if err := finishedRecorder.Finish(lastFrameTime); err != nil {
 			return err
 		}
 		if err := e.emitEventSaved(dir); err != nil && !errors.Is(err, ErrStopTracking) {
@@ -332,6 +324,50 @@ func (e *TrackerEngine) Run() error {
 	}
 
 	return nil
+}
+
+func finishTrackerRunResources(buffer []BufferedFrame, recorder *EventRecorder, segmentRecorder *RawSegmentRecorder, endedAt time.Time) error {
+	closeBuffer(buffer)
+	var errs []error
+	if recorder != nil {
+		if endedAt.IsZero() {
+			endedAt = recorder.StartedAt
+		}
+		if err := recorder.Finish(endedAt); err != nil {
+			errs = append(errs, fmt.Errorf("finalize open event recorder: %w", err))
+		}
+	}
+	if segmentRecorder != nil {
+		if err := segmentRecorder.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("finalize raw segment recorder: %w", err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func sourceFrameTimestamp(inputLabel string, anchor, observedAt time.Time, sourceFrame int, fps float64) time.Time {
+	if inputLabel != "video file" || sourceFrame <= 1 || !validFPS(fps) {
+		return observedAt
+	}
+	offset := time.Duration(float64(sourceFrame-1) * float64(time.Second) / fps)
+	return anchor.Add(offset)
+}
+
+func sourceFrameDelta(previous, current time.Time, fps float64) float64 {
+	if !previous.IsZero() {
+		delta := current.Sub(previous).Seconds()
+		if delta > 0 && delta <= 1 {
+			return delta
+		}
+	}
+	if validFPS(fps) {
+		return 1.0 / fps
+	}
+	return 1.0 / 30.0
+}
+
+func validFPS(fps float64) bool {
+	return fps > 0 && !math.IsNaN(fps) && !math.IsInf(fps, 0)
 }
 
 func (e *TrackerEngine) stopped() bool {
@@ -358,8 +394,11 @@ func (e *TrackerEngine) openCapture() (*gocv.VideoCapture, float64, error) {
 	}
 
 	fps := capture.Get(gocv.VideoCaptureFPS)
-	if fps <= 1 || math.IsNaN(fps) || math.IsInf(fps, 0) {
+	if fps <= 1 || !validFPS(fps) {
 		fps = e.Config.FallbackFPS
+	}
+	if !validFPS(fps) {
+		fps = 30
 	}
 
 	return capture, fps, nil

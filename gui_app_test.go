@@ -1,6 +1,11 @@
 package main
 
 import (
+	"errors"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,6 +48,22 @@ func TestSelectDwarfMediaFileSkipsDownloadedAndUsesCameraFallback(t *testing.T) 
 	}
 	if selected.Path != files[1].Path {
 		t.Fatalf("unexpected selection: %s", selected.Path)
+	}
+}
+
+func TestSelectDwarfMediaFileDoesNotFallbackForNamedRecording(t *testing.T) {
+	startedAt := time.Date(2026, time.August, 21, 15, 0, 0, 0, time.Local)
+	files := []DwarfMediaFile{
+		{
+			Path:    "/DWARF3_TELE_2026-08-21-14-34-00-000.mp4",
+			Name:    "DWARF3_TELE_2026-08-21-14-34-00-000.mp4",
+			ModTime: startedAt.Add(-26 * time.Minute),
+		},
+	}
+
+	selected := selectDwarfMediaFile(files, nil, dwarfCameraTele, "DWARF_20260821150000", startedAt)
+	if selected != nil {
+		t.Fatalf("selected unrelated fallback while requested recording was still absent: %+v", selected)
 	}
 }
 
@@ -125,6 +146,9 @@ func TestMoveDwarfQueuedRecordingToStage(t *testing.T) {
 		RemotePath: "/Videos/clip.mp4",
 		LocalPath:  initialPath,
 	}
+	if err := writeDwarfRecordingMetadata(recording); err != nil {
+		t.Fatalf("write recording metadata: %v", err)
+	}
 
 	moved, err := moveDwarfQueuedRecordingToStage(recording, dwarfQueueStageUnderProcessing)
 	if err != nil {
@@ -137,6 +161,9 @@ func TestMoveDwarfQueuedRecordingToStage(t *testing.T) {
 	if _, err := os.Stat(wantUnderProcessing); err != nil {
 		t.Fatalf("expected moved file to exist: %v", err)
 	}
+	if _, err := os.Stat(wantUnderProcessing + ".metadata.json"); err != nil {
+		t.Fatalf("expected moved metadata to exist: %v", err)
+	}
 
 	moved, err = moveDwarfQueuedRecordingToStage(moved, dwarfQueueStageProcessed)
 	if err != nil {
@@ -148,5 +175,165 @@ func TestMoveDwarfQueuedRecordingToStage(t *testing.T) {
 	}
 	if _, err := os.Stat(wantProcessed); err != nil {
 		t.Fatalf("expected processed file to exist: %v", err)
+	}
+	if _, err := os.Stat(wantProcessed + ".metadata.json"); err != nil {
+		t.Fatalf("expected processed metadata to exist: %v", err)
+	}
+}
+
+func TestDwarfQueuedRecordingSessionDirHandlesUnstagedDownload(t *testing.T) {
+	path := filepath.Join("dwarf_downloads", "clip.mp4")
+	if got, want := dwarfQueuedRecordingSessionDir(path), "dwarf_downloads"; got != want {
+		t.Fatalf("unexpected session directory: got %s want %s", got, want)
+	}
+}
+
+func TestRecoverDwarfQueuedRecordingsReturnsUnderProcessingFileToQueue(t *testing.T) {
+	downloadDir := t.TempDir()
+	sessionDir := filepath.Join(downloadDir, "2026-09-08_120000")
+	underProcessingDir := filepath.Join(sessionDir, dwarfQueueStageUnderProcessing)
+	if err := os.MkdirAll(underProcessingDir, 0o755); err != nil {
+		t.Fatalf("create under-processing directory: %v", err)
+	}
+	videoPath := filepath.Join(underProcessingDir, "DWARF3_WIDE_2026-09-08-12-00-00-000.mp4")
+	if err := os.WriteFile(videoPath, []byte("video"), 0o644); err != nil {
+		t.Fatalf("write video: %v", err)
+	}
+	latitude := 59.3293
+	recording := DwarfQueuedRecording{
+		Camera:       dwarfCameraWide,
+		RemotePath:   "/Videos/" + filepath.Base(videoPath),
+		RemoteName:   filepath.Base(videoPath),
+		LocalPath:    videoPath,
+		DownloadedAt: time.Date(2026, time.September, 8, 12, 1, 0, 0, time.UTC),
+		Capture:      CaptureMetadata{Source: "DWARF 3", Camera: dwarfCameraWide, Latitude: &latitude},
+	}
+	if err := writeDwarfRecordingMetadata(recording); err != nil {
+		t.Fatalf("write metadata: %v", err)
+	}
+
+	recovered, err := recoverDwarfQueuedRecordings(downloadDir)
+	if err != nil {
+		t.Fatalf("recover queue: %v", err)
+	}
+	if len(recovered) != 1 {
+		t.Fatalf("expected one recovered recording, got %d: %+v", len(recovered), recovered)
+	}
+	wantPath := filepath.Join(sessionDir, dwarfQueueStageQueue, filepath.Base(videoPath))
+	if recovered[0].LocalPath != wantPath {
+		t.Fatalf("unexpected recovered path: got %s want %s", recovered[0].LocalPath, wantPath)
+	}
+	if recovered[0].Capture.Latitude == nil || *recovered[0].Capture.Latitude != latitude {
+		t.Fatalf("capture metadata was not recovered: %+v", recovered[0].Capture)
+	}
+	stored, err := readDwarfRecordingMetadata(wantPath)
+	if err != nil {
+		t.Fatalf("read recovered metadata: %v", err)
+	}
+	if stored.LocalPath != wantPath {
+		t.Fatalf("metadata retained stale path: got %s want %s", stored.LocalPath, wantPath)
+	}
+	if _, err := os.Stat(videoPath); !os.IsNotExist(err) {
+		t.Fatalf("under-processing video still exists, stat error=%v", err)
+	}
+}
+
+func TestFailedDwarfRecordingIsRequeued(t *testing.T) {
+	root := t.TempDir()
+	underProcessingDir := filepath.Join(root, dwarfQueueStageUnderProcessing)
+	if err := os.MkdirAll(underProcessingDir, 0o755); err != nil {
+		t.Fatalf("create under-processing directory: %v", err)
+	}
+	videoPath := filepath.Join(underProcessingDir, "clip.mp4")
+	if err := os.WriteFile(videoPath, []byte("video"), 0o644); err != nil {
+		t.Fatalf("write video: %v", err)
+	}
+	recording := DwarfQueuedRecording{
+		RemotePath: "/Videos/clip.mp4",
+		RemoteName: "clip.mp4",
+		LocalPath:  videoPath,
+	}
+	if err := writeDwarfRecordingMetadata(recording); err != nil {
+		t.Fatalf("write metadata: %v", err)
+	}
+
+	ui := &trackerApp{dwarfDownloadedFiles: make(map[string]DwarfQueuedRecording)}
+	processErr := errors.New("processing failed")
+	if err := ui.requeueFailedDwarfRecording(recording, processErr); !errors.Is(err, processErr) {
+		t.Fatalf("processing error was not preserved: %v", err)
+	}
+	if len(ui.dwarfQueuedFiles) != 1 {
+		t.Fatalf("expected failed recording back in queue, got %+v", ui.dwarfQueuedFiles)
+	}
+	wantPath := filepath.Join(root, dwarfQueueStageQueue, "clip.mp4")
+	if ui.dwarfQueuedFiles[0].LocalPath != wantPath {
+		t.Fatalf("unexpected requeued path: got %s want %s", ui.dwarfQueuedFiles[0].LocalPath, wantPath)
+	}
+	if _, err := os.Stat(wantPath); err != nil {
+		t.Fatalf("requeued video is missing: %v", err)
+	}
+}
+
+func TestMediaHandlerServesOnlyExplicitlyRegisteredFiles(t *testing.T) {
+	root := t.TempDir()
+	secretPath := filepath.Join(root, "secret.txt")
+	mediaPath := filepath.Join(root, "preview.jpg")
+	if err := os.WriteFile(secretPath, []byte("secret"), 0o600); err != nil {
+		t.Fatalf("write secret: %v", err)
+	}
+	if err := os.WriteFile(mediaPath, []byte("media"), 0o644); err != nil {
+		t.Fatalf("write media: %v", err)
+	}
+
+	ui := &trackerApp{
+		projectRoot:        root,
+		mediaServerBaseURL: "http://media.test/files/",
+		mediaFiles:         make(map[string]string),
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/files/", http.StripPrefix("/files/", http.HandlerFunc(ui.serveProjectFile)))
+
+	unauthorized := httptest.NewRecorder()
+	mux.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "http://media.test/files/secret.txt", nil))
+	if unauthorized.Code != http.StatusNotFound {
+		t.Fatalf("unregistered project file returned status %d", unauthorized.Code)
+	}
+
+	mediaURL := ui.projectFileURL(mediaPath)
+	if mediaURL == "" {
+		t.Fatal("expected registered media URL")
+	}
+	if strings.Contains(mediaURL, filepath.Base(mediaPath)) {
+		t.Fatalf("media URL disclosed the project path: %s", mediaURL)
+	}
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, httptest.NewRequest(http.MethodGet, mediaURL, nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("registered media returned status %d", response.Code)
+	}
+	body, err := io.ReadAll(response.Result().Body)
+	if err != nil {
+		t.Fatalf("read media response: %v", err)
+	}
+	if string(body) != "media" {
+		t.Fatalf("unexpected media response: %q", body)
+	}
+}
+
+func TestMediaServerBindsOnlyToLoopback(t *testing.T) {
+	ip := net.ParseIP(mediaServerHost)
+	if ip == nil || !ip.IsLoopback() {
+		t.Fatalf("media server bind address is not loopback-only: %q", mediaServerHost)
+	}
+}
+
+func TestFloatParsersRejectNonFiniteValues(t *testing.T) {
+	for _, value := range []string{"NaN", "+Inf", "-Inf"} {
+		if _, err := parseRequiredFloat(value, "Value"); err == nil {
+			t.Errorf("parseRequiredFloat accepted %q", value)
+		}
+		if _, ok := parseOptionalFloat(value); ok {
+			t.Errorf("parseOptionalFloat accepted %q", value)
+		}
 	}
 }

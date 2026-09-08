@@ -74,13 +74,14 @@ type DwarfProtoTransport struct {
 	debug   bool
 	config  DwarfProtoSessionConfig
 
-	mu       sync.Mutex
-	conn     *websocket.Conn
-	closed   chan struct{}
-	pingDone chan struct{}
-	state    DwarfProtoSessionState
-	nextID   uint32
-	pending  []dwarfProtoPacket
+	mu        sync.Mutex
+	conn      *websocket.Conn
+	closeConn func(*websocket.Conn) error
+	closed    chan struct{}
+	pingDone  chan struct{}
+	state     DwarfProtoSessionState
+	nextID    uint32
+	pending   []dwarfProtoPacket
 }
 
 type DwarfProtoCommandResult struct {
@@ -154,24 +155,38 @@ func (t *DwarfProtoTransport) Connect() error {
 	}
 	t.nextID = 0
 	t.log("PROTO CONNECT %s client=%s", t.url, t.config.ClientID)
-	go t.runPingLoop()
+	go t.runPingLoop(conn, t.closed, t.pingDone)
 	return nil
 }
 
 func (t *DwarfProtoTransport) Close() error {
 	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	if t.conn == nil {
+		t.mu.Unlock()
 		return nil
 	}
 
-	close(t.closed)
 	conn := t.conn
+	closed := t.closed
+	pingDone := t.pingDone
 	t.conn = nil
+	t.closed = nil
+	t.pingDone = nil
+	t.mu.Unlock()
+
+	if closed != nil {
+		close(closed)
+	}
 	t.log("PROTO CLOSE %s", t.url)
-	err := conn.Close()
-	<-t.pingDone
+	var err error
+	if t.closeConn != nil {
+		err = t.closeConn(conn)
+	} else {
+		err = conn.Close()
+	}
+	if pingDone != nil {
+		<-pingDone
+	}
 	return err
 }
 
@@ -348,8 +363,8 @@ func (t *DwarfProtoTransport) takePendingPacket(match func(dwarfProtoPacket) boo
 	return dwarfProtoPacket{}, false
 }
 
-func (t *DwarfProtoTransport) runPingLoop() {
-	defer close(t.pingDone)
+func (t *DwarfProtoTransport) runPingLoop(conn *websocket.Conn, closed <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
 
 	if t.config.PingInterval <= 0 {
 		return
@@ -361,17 +376,12 @@ func (t *DwarfProtoTransport) runPingLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			t.mu.Lock()
-			conn := t.conn
-			t.mu.Unlock()
-			if conn != nil {
-				if err := websocket.Message.Send(conn, "ping"); err != nil {
-					t.log("PROTO KEEPALIVE ERROR %s client=%s err=%v", t.url, t.config.ClientID, err)
-				} else {
-					t.log("PROTO KEEPALIVE %s client=%s", t.url, t.config.ClientID)
-				}
+			if err := websocket.Message.Send(conn, "ping"); err != nil {
+				t.log("PROTO KEEPALIVE ERROR %s client=%s err=%v", t.url, t.config.ClientID, err)
+			} else {
+				t.log("PROTO KEEPALIVE %s client=%s", t.url, t.config.ClientID)
 			}
-		case <-t.closed:
+		case <-closed:
 			return
 		}
 	}

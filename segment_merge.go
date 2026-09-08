@@ -50,6 +50,7 @@ type segmentTrackKey struct {
 type frameMergeState struct {
 	sourceFrame int
 	timeMS      int64
+	meanLuma    float64
 	tracks      map[int]TrackMetadata
 }
 
@@ -64,7 +65,7 @@ func MergeSegmentTrackingResults(manifest RawSegmentManifest, segments []EventMe
 	settings = NormalizeTrackingSettings(settings)
 	globalized := make([]EventMetadata, len(segments))
 	for i := range segments {
-		globalized[i] = globalizeSegmentMetadata(manifest.Segments[i], segments[i], manifest.CreatedAt)
+		globalized[i] = globalizeSegmentMetadata(manifest.Segments[i], segments[i], manifest.CreatedAt, manifest.Capture)
 	}
 
 	roots := newSegmentTrackUnion(globalized)
@@ -110,7 +111,7 @@ func MergeSegmentTrackingResults(manifest RawSegmentManifest, segments []EventMe
 	}, nil
 }
 
-func globalizeSegmentMetadata(segment RawVideoSegment, metadata EventMetadata, startedAt time.Time) EventMetadata {
+func globalizeSegmentMetadata(segment RawVideoSegment, metadata EventMetadata, startedAt time.Time, capture CaptureMetadata) EventMetadata {
 	frames := make([]FrameMetadata, 0, len(metadata.Frames))
 	for _, frame := range metadata.Frames {
 		globalFrame := frame
@@ -127,6 +128,9 @@ func globalizeSegmentMetadata(segment RawVideoSegment, metadata EventMetadata, s
 		}
 		frames = append(frames, globalFrame)
 	}
+	if metadata.Capture == (CaptureMetadata{}) {
+		metadata.Capture = capture
+	}
 
 	return EventMetadata{
 		EventID:   metadata.EventID,
@@ -134,6 +138,7 @@ func globalizeSegmentMetadata(segment RawVideoSegment, metadata EventMetadata, s
 		FPS:       metadata.FPS,
 		Width:     metadata.Width,
 		Height:    metadata.Height,
+		Capture:   metadata.Capture,
 		Frames:    frames,
 	}
 }
@@ -315,8 +320,16 @@ func mergeGlobalizedFrames(segments []EventMetadata, globalIDs map[segmentTrackK
 	fps := 0.0
 	width := 0
 	height := 0
+	eventID := ""
+	capture := CaptureMetadata{}
 
 	for segmentIndex, metadata := range segments {
+		if eventID == "" {
+			eventID = metadata.EventID
+		}
+		if capture == (CaptureMetadata{}) && metadata.Capture != (CaptureMetadata{}) {
+			capture = metadata.Capture
+		}
 		if fps <= 0 {
 			fps = metadata.FPS
 		}
@@ -333,6 +346,7 @@ func mergeGlobalizedFrames(segments []EventMetadata, globalIDs map[segmentTrackK
 				state = &frameMergeState{
 					sourceFrame: frame.SourceFrame,
 					timeMS:      frame.TimeMS,
+					meanLuma:    frame.MeanLuma,
 					tracks:      make(map[int]TrackMetadata),
 				}
 				frames[frame.SourceFrame] = state
@@ -372,6 +386,7 @@ func mergeGlobalizedFrames(segments []EventMetadata, globalIDs map[segmentTrackK
 		frame := FrameMetadata{
 			SourceFrame: sourceFrame,
 			TimeMS:      state.timeMS,
+			MeanLuma:    state.meanLuma,
 			Tracks:      tracks,
 		}
 		if !startedAt.IsZero() {
@@ -381,10 +396,12 @@ func mergeGlobalizedFrames(segments []EventMetadata, globalIDs map[segmentTrackK
 	}
 
 	return EventMetadata{
+		EventID:   eventID,
 		StartedAt: startedAt,
 		FPS:       fps,
 		Width:     width,
 		Height:    height,
+		Capture:   capture,
 		Frames:    mergedFrames,
 	}
 }

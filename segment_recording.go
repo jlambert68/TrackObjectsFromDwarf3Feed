@@ -35,7 +35,7 @@ type RawSegmentRecorder struct {
 	overlapBuffer []segmentBufferFrame
 }
 
-func startRawSegmentRecorder(outputRoot string, fps float64, width, height int, settings TrackingSettings) (*RawSegmentRecorder, error) {
+func startRawSegmentRecorder(outputRoot string, fps float64, width, height int, settings TrackingSettings, capture CaptureMetadata) (*RawSegmentRecorder, error) {
 	if settings.RawSegmentDuration <= 0 {
 		return nil, nil
 	}
@@ -64,6 +64,7 @@ func startRawSegmentRecorder(outputRoot string, fps float64, width, height int, 
 			FPS:             fps,
 			Width:           width,
 			Height:          height,
+			Capture:         capture,
 			SegmentDuration: settings.RawSegmentDuration,
 			SegmentOverlap:  settings.RawSegmentOverlap,
 		},
@@ -78,7 +79,7 @@ func (r *RawSegmentRecorder) RecordFrame(frame gocv.Mat, sourceFrame int, timeOf
 	}
 
 	if r.currentWriter == nil {
-		if err := r.openSegment(nil); err != nil {
+		if err := r.openSegment(r.overlapBuffer); err != nil {
 			return err
 		}
 	}
@@ -98,11 +99,9 @@ func (r *RawSegmentRecorder) RecordFrame(frame gocv.Mat, sourceFrame int, timeOf
 	r.pushOverlapFrame(frame, sourceFrame, timeOffset)
 
 	if r.currentFrames >= r.segmentFrames {
-		carried := len(r.overlapBuffer)
-		if err := r.finishCurrentSegment(carried); err != nil {
+		if err := r.finishCurrentSegment(0); err != nil {
 			return err
 		}
-		return r.openSegment(r.overlapBuffer)
 	}
 
 	return nil
@@ -163,6 +162,9 @@ func (r *RawSegmentRecorder) openSegment(prefill []segmentBufferFrame) error {
 		r.lastSourceFrame = buffered.SourceFrame
 		r.lastSourceTimeMS = buffered.TimeOffset.Milliseconds()
 	}
+	if len(prefill) > 0 && len(r.Manifest.Segments) > 0 {
+		r.Manifest.Segments[len(r.Manifest.Segments)-1].OverlapAfterFrames = len(prefill)
+	}
 
 	return nil
 }
@@ -172,7 +174,7 @@ func (r *RawSegmentRecorder) finishCurrentSegment(overlapAfterFrames int) error 
 		return nil
 	}
 
-	r.currentWriter.Close()
+	closeErr := r.currentWriter.Close()
 	r.currentWriter = nil
 	r.currentSegment.EndFrame = r.lastSourceFrame
 	r.currentSegment.EndTimeMS = r.lastSourceTimeMS
@@ -182,6 +184,9 @@ func (r *RawSegmentRecorder) finishCurrentSegment(overlapAfterFrames int) error 
 	r.currentSegment = RawVideoSegment{}
 	r.currentFrames = 0
 	r.currentSegmentPath = ""
+	if closeErr != nil {
+		return fmt.Errorf("close raw segment writer: %w", closeErr)
+	}
 	return nil
 }
 

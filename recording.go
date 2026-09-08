@@ -90,6 +90,7 @@ func startEvent(
 	width, height int,
 	buffer []BufferedFrame,
 	settings TrackingSettings,
+	capture CaptureMetadata,
 ) (*EventRecorder, error) {
 	if len(buffer) == 0 {
 		return nil, errors.New("cannot start event with empty buffer")
@@ -159,6 +160,8 @@ func startEvent(
 		EventID:       filepath.Base(dir),
 		SeenIDs:       make(map[int]struct{}),
 		Settings:      NormalizeTrackingSettings(settings),
+		Capture:       capture,
+		MinLuma:       255,
 	}
 
 	if err := recorder.openTrackingStream(); err != nil {
@@ -238,6 +241,13 @@ func (r *EventRecorder) RecordFrame(clean gocv.Mat, mask gocv.Mat, tracks []*Tra
 			r.HighestSpeed = t.Speed
 		}
 	}
+	r.LumaSum += meta.MeanLuma
+	if meta.MeanLuma < r.MinLuma {
+		r.MinLuma = meta.MeanLuma
+	}
+	if meta.MeanLuma > r.MaxLuma {
+		r.MaxLuma = meta.MeanLuma
+	}
 
 	if err := r.appendTrackingFrame(meta); err != nil {
 		return err
@@ -258,6 +268,13 @@ func (r *EventRecorder) Finish(endedAt time.Time) error {
 		errs = append(errs, err)
 	}
 
+	photometry := PhotometricSummary{MinLuma: r.MinLuma, MaxLuma: r.MaxLuma, Samples: r.FramesWritten}
+	if r.FramesWritten > 0 {
+		photometry.MeanLuma = r.LumaSum / float64(r.FramesWritten)
+	} else {
+		photometry.MinLuma = 0
+	}
+
 	summary := EventSummary{
 		EventID:           r.EventID,
 		StartedAt:         r.StartedAt,
@@ -276,6 +293,8 @@ func (r *EventRecorder) Finish(endedAt time.Time) error {
 		TrackNamesFile:    "track_names.json",
 		TrackingMetadata:  "tracking.json",
 		TrackingSettings:  r.Settings,
+		Capture:           r.Capture,
+		Photometry:        photometry,
 	}
 
 	summaryData, err := json.MarshalIndent(summary, "", "  ")
@@ -540,17 +559,19 @@ func (r *EventRecorder) openTrackingStream() error {
 	}
 
 	header := struct {
-		EventID   string    `json:"event_id"`
-		StartedAt time.Time `json:"started_at"`
-		FPS       float64   `json:"fps"`
-		Width     int       `json:"width"`
-		Height    int       `json:"height"`
+		EventID   string          `json:"event_id"`
+		StartedAt time.Time       `json:"started_at"`
+		FPS       float64         `json:"fps"`
+		Width     int             `json:"width"`
+		Height    int             `json:"height"`
+		Capture   CaptureMetadata `json:"capture"`
 	}{
 		EventID:   r.EventID,
 		StartedAt: r.StartedAt,
 		FPS:       r.FPS,
 		Width:     r.Width,
 		Height:    r.Height,
+		Capture:   r.Capture,
 	}
 
 	data, err := json.Marshal(header)

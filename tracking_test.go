@@ -2,7 +2,9 @@ package main
 
 import (
 	"image"
+	"math"
 	"testing"
+	"time"
 )
 
 func TestDefaultGeneralTrackingSettingsAreHardened(t *testing.T) {
@@ -66,5 +68,40 @@ func TestClassifyTrackAcceptsRealMotion(t *testing.T) {
 	}
 	if trackType != trackTypeFast {
 		t.Fatalf("expected fast track, got %s", trackType)
+	}
+}
+
+func TestNormalizeTrackingSettingsPreservesAcceptedZeroValues(t *testing.T) {
+	settings := DefaultTrackingSettings()
+	settings.MinArea = 0
+	settings.SlowMinSpeed = 0
+	settings.MinSpeed = 0
+	settings.ForegroundThreshold = 0
+	settings.PreEventDuration = 0
+	settings.PostEventDuration = 0
+
+	got := NormalizeTrackingSettings(settings)
+	if got.MinArea != 0 || got.SlowMinSpeed != 0 || got.MinSpeed != 0 || got.ForegroundThreshold != 0 {
+		t.Fatalf("numeric zero values were replaced: %+v", got)
+	}
+	if got.PreEventDuration != 0 || got.PostEventDuration != 0 {
+		t.Fatalf("zero event buffers were replaced: pre=%s post=%s", got.PreEventDuration, got.PostEventDuration)
+	}
+}
+
+func TestNormalizeTrackingSettingsReplacesNonFiniteValues(t *testing.T) {
+	settings := DefaultTrackingSettings()
+	settings.MinArea = math.NaN()
+	settings.MinSpeed = math.Inf(1)
+	settings.TrackingROIHeightFrac = math.NaN()
+	settings.PreEventDuration = -time.Second
+
+	got := NormalizeTrackingSettings(settings)
+	defaults := DefaultTrackingSettings()
+	if got.MinArea != defaults.MinArea || got.MinSpeed != defaults.MinSpeed || got.TrackingROIHeightFrac != defaults.TrackingROIHeightFrac {
+		t.Fatalf("non-finite settings were not normalized: %+v", got)
+	}
+	if got.PreEventDuration != defaults.PreEventDuration {
+		t.Fatalf("negative pre-event duration was not normalized: %s", got.PreEventDuration)
 	}
 }

@@ -1,6 +1,9 @@
 package main
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -103,6 +106,63 @@ func TestMergeSegmentTrackingResultsKeepsDistinctTracksSeparate(t *testing.T) {
 	}
 	if merged.Assignments[0].GlobalTrackID == merged.Assignments[1].GlobalTrackID {
 		t.Fatalf("expected distinct global IDs, assignments=%+v", merged.Assignments)
+	}
+}
+
+func TestMergeSegmentTrackingResultsPreservesCaptureAndPhotometry(t *testing.T) {
+	startedAt := time.Date(2026, time.September, 8, 12, 0, 0, 0, time.UTC)
+	latitude := 59.3293
+	capture := CaptureMetadata{
+		Source:   "DWARF 3",
+		Camera:   dwarfCameraWide,
+		Latitude: &latitude,
+	}
+	manifest := RawSegmentManifest{
+		CreatedAt: startedAt,
+		Capture:   capture,
+		Segments: []RawVideoSegment{
+			{Index: 1, File: "segment_000001.avi", StartFrame: 1, EndFrame: 2, StartTimeMS: 0, EndTimeMS: 100, Frames: 2},
+		},
+	}
+	segment := EventMetadata{
+		EventID: "segment_event",
+		FPS:     10,
+		Width:   640,
+		Height:  480,
+		Frames: []FrameMetadata{
+			{SourceFrame: 1, TimeMS: 0, MeanLuma: 10},
+			{SourceFrame: 2, TimeMS: 100, MeanLuma: 20},
+		},
+	}
+
+	merged, err := MergeSegmentTrackingResults(manifest, []EventMetadata{segment}, DefaultTrackingSettings())
+	if err != nil {
+		t.Fatalf("merge segment: %v", err)
+	}
+	if merged.Metadata.Capture.Source != capture.Source || merged.Metadata.Capture.Camera != capture.Camera {
+		t.Fatalf("capture metadata was dropped: %+v", merged.Metadata.Capture)
+	}
+	if merged.Metadata.Capture.Latitude == nil || *merged.Metadata.Capture.Latitude != latitude {
+		t.Fatalf("capture latitude was dropped: %+v", merged.Metadata.Capture)
+	}
+	if len(merged.Metadata.Frames) != 2 || merged.Metadata.Frames[0].MeanLuma != 10 || merged.Metadata.Frames[1].MeanLuma != 20 {
+		t.Fatalf("frame luminance was dropped: %+v", merged.Metadata.Frames)
+	}
+
+	processedDir := t.TempDir()
+	if err := writeMergedSegmentOutputs(processedDir, merged, DefaultTrackingSettings()); err != nil {
+		t.Fatalf("write merged outputs: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(processedDir, "merged_event.json"))
+	if err != nil {
+		t.Fatalf("read merged summary: %v", err)
+	}
+	var summary EventSummary
+	if err := json.Unmarshal(data, &summary); err != nil {
+		t.Fatalf("decode merged summary: %v", err)
+	}
+	if summary.Capture.Source != capture.Source || summary.Photometry.Samples != 2 || summary.Photometry.MeanLuma != 15 {
+		t.Fatalf("merged summary omitted metadata: %+v", summary)
 	}
 }
 

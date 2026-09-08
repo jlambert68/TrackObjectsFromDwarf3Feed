@@ -3,6 +3,7 @@ package main
 import (
 	"image"
 	"image/color"
+	"math"
 	"os"
 	"time"
 
@@ -119,22 +120,26 @@ func trackingProfileOptions() []string {
 }
 
 func NormalizeTrackingSettings(settings TrackingSettings) TrackingSettings {
+	wasZeroValue := settings == (TrackingSettings{})
 	settings.Profile = normalizeTrackingProfile(settings.Profile)
 	defaults := DefaultTrackingSettingsForProfile(settings.Profile)
+	if wasZeroValue {
+		return defaults
+	}
 
-	if settings.MinArea <= 0 {
+	if settings.MinArea < 0 || !isFiniteFloat(settings.MinArea) {
 		settings.MinArea = defaults.MinArea
 	}
-	if settings.MaxArea <= settings.MinArea {
+	if settings.MaxArea <= settings.MinArea || !isFiniteFloat(settings.MaxArea) {
 		settings.MaxArea = defaults.MaxArea
 	}
-	if settings.SlowMinSpeed <= 0 {
+	if settings.SlowMinSpeed < 0 || !isFiniteFloat(settings.SlowMinSpeed) {
 		settings.SlowMinSpeed = defaults.SlowMinSpeed
 	}
-	if settings.MinSpeed < settings.SlowMinSpeed {
+	if settings.MinSpeed < settings.SlowMinSpeed || !isFiniteFloat(settings.MinSpeed) {
 		settings.MinSpeed = defaults.MinSpeed
 	}
-	if settings.MaxMatchDistance <= 0 {
+	if settings.MaxMatchDistance <= 0 || !isFiniteFloat(settings.MaxMatchDistance) {
 		settings.MaxMatchDistance = defaults.MaxMatchDistance
 	}
 	if settings.MinHits < 1 {
@@ -143,13 +148,13 @@ func NormalizeTrackingSettings(settings TrackingSettings) TrackingSettings {
 	if settings.BlurSize < 1 || settings.BlurSize%2 == 0 {
 		settings.BlurSize = defaults.BlurSize
 	}
-	if settings.ForegroundThreshold <= 0 {
+	if settings.ForegroundThreshold < 0 || settings.ForegroundThreshold > 255 || !isFiniteFloat(settings.ForegroundThreshold) {
 		settings.ForegroundThreshold = defaults.ForegroundThreshold
 	}
-	if settings.PreEventDuration <= 0 {
+	if settings.PreEventDuration < 0 {
 		settings.PreEventDuration = defaults.PreEventDuration
 	}
-	if settings.PostEventDuration <= 0 {
+	if settings.PostEventDuration < 0 {
 		settings.PostEventDuration = defaults.PostEventDuration
 	}
 	if settings.RawSegmentDuration < 0 {
@@ -167,14 +172,18 @@ func NormalizeTrackingSettings(settings TrackingSettings) TrackingSettings {
 	if settings.MOG2History < 1 {
 		settings.MOG2History = defaults.MOG2History
 	}
-	if settings.MOG2VarThreshold <= 0 {
+	if settings.MOG2VarThreshold <= 0 || !isFiniteFloat(settings.MOG2VarThreshold) {
 		settings.MOG2VarThreshold = defaults.MOG2VarThreshold
 	}
-	if settings.TrackingROIHeightFrac <= 0 || settings.TrackingROIHeightFrac > 1 {
+	if settings.TrackingROIHeightFrac <= 0 || settings.TrackingROIHeightFrac > 1 || !isFiniteFloat(settings.TrackingROIHeightFrac) {
 		settings.TrackingROIHeightFrac = defaults.TrackingROIHeightFrac
 	}
 
 	return settings
+}
+
+func isFiniteFloat(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0)
 }
 
 // Overlay colors for the live view and the tracked event exports.
@@ -251,29 +260,54 @@ type FrameMetadata struct {
 	SourceFrame int             `json:"source_frame"`
 	TimeUnixNS  int64           `json:"time_unix_ns"`
 	TimeMS      int64           `json:"time_ms"`
+	MeanLuma    float64         `json:"mean_luma"`
 	Tracks      []TrackMetadata `json:"tracks"`
+}
+
+// CaptureMetadata describes where and how a DWARF recording was captured.
+// Pointer fields distinguish an unknown value from a valid zero value.
+type CaptureMetadata struct {
+	Source         string   `json:"source,omitempty"`
+	Camera         string   `json:"camera,omitempty"`
+	Latitude       *float64 `json:"latitude,omitempty"`
+	Longitude      *float64 `json:"longitude,omitempty"`
+	AltitudeM      *float64 `json:"altitude_m,omitempty"`
+	AzimuthDeg     *float64 `json:"azimuth_deg,omitempty"`
+	ElevationDeg   *float64 `json:"elevation_deg,omitempty"`
+	ExposureMS     *float64 `json:"exposure_ms,omitempty"`
+	Gain           *float64 `json:"gain,omitempty"`
+	LocationSource string   `json:"location_source,omitempty"`
+}
+
+type PhotometricSummary struct {
+	MeanLuma float64 `json:"mean_luma"`
+	MinLuma  float64 `json:"min_luma"`
+	MaxLuma  float64 `json:"max_luma"`
+	Samples  int     `json:"samples"`
 }
 
 // EventSummary is the short per-event manifest written beside the captured
 // videos and full tracking JSON.
 type EventSummary struct {
-	EventID           string           `json:"event_id"`
-	StartedAt         time.Time        `json:"started_at"`
-	EndedAt           time.Time        `json:"ended_at"`
-	DurationSeconds   float64          `json:"duration_seconds"`
-	Width             int              `json:"width"`
-	Height            int              `json:"height"`
-	FPS               float64          `json:"fps"`
-	Frames            int              `json:"frames"`
-	UniqueObjects     int              `json:"unique_objects"`
-	HighestSpeedPxSec float64          `json:"highest_speed_px_s"`
-	OriginalVideo     string           `json:"original_video"`
-	TrackedVideo      string           `json:"tracked_video"`
-	MaskedVideo       string           `json:"masked_video"`
-	TrackCropsDir     string           `json:"track_crops_dir"`
-	TrackNamesFile    string           `json:"track_names_file"`
-	TrackingMetadata  string           `json:"tracking_metadata"`
-	TrackingSettings  TrackingSettings `json:"tracking_settings"`
+	EventID           string             `json:"event_id"`
+	StartedAt         time.Time          `json:"started_at"`
+	EndedAt           time.Time          `json:"ended_at"`
+	DurationSeconds   float64            `json:"duration_seconds"`
+	Width             int                `json:"width"`
+	Height            int                `json:"height"`
+	FPS               float64            `json:"fps"`
+	Frames            int                `json:"frames"`
+	UniqueObjects     int                `json:"unique_objects"`
+	HighestSpeedPxSec float64            `json:"highest_speed_px_s"`
+	OriginalVideo     string             `json:"original_video"`
+	TrackedVideo      string             `json:"tracked_video"`
+	MaskedVideo       string             `json:"masked_video"`
+	TrackCropsDir     string             `json:"track_crops_dir"`
+	TrackNamesFile    string             `json:"track_names_file"`
+	TrackingMetadata  string             `json:"tracking_metadata"`
+	TrackingSettings  TrackingSettings   `json:"tracking_settings"`
+	Capture           CaptureMetadata    `json:"capture"`
+	Photometry        PhotometricSummary `json:"photometry"`
 }
 
 // EventMetadata contains the full timeline for a recorded event.
@@ -283,6 +317,7 @@ type EventMetadata struct {
 	FPS       float64         `json:"fps"`
 	Width     int             `json:"width"`
 	Height    int             `json:"height"`
+	Capture   CaptureMetadata `json:"capture"`
 	Frames    []FrameMetadata `json:"frames"`
 }
 
@@ -304,20 +339,22 @@ type RawSegmentManifest struct {
 	FPS             float64           `json:"fps"`
 	Width           int               `json:"width"`
 	Height          int               `json:"height"`
+	Capture         CaptureMetadata   `json:"capture"`
 	SegmentDuration time.Duration     `json:"segment_duration"`
 	SegmentOverlap  time.Duration     `json:"segment_overlap"`
 	Segments        []RawVideoSegment `json:"segments"`
 }
 
 type DwarfQueuedRecording struct {
-	Camera          string    `json:"camera"`
-	RemotePath      string    `json:"remote_path"`
-	RemoteName      string    `json:"remote_name"`
-	LocalPath       string    `json:"local_path"`
-	RecordingName   string    `json:"recording_name,omitempty"`
-	RecordingStart  time.Time `json:"recording_start,omitempty"`
-	DownloadedAt    time.Time `json:"downloaded_at"`
-	DeleteRequested bool      `json:"delete_requested"`
+	Camera          string          `json:"camera"`
+	RemotePath      string          `json:"remote_path"`
+	RemoteName      string          `json:"remote_name"`
+	LocalPath       string          `json:"local_path"`
+	RecordingName   string          `json:"recording_name,omitempty"`
+	RecordingStart  time.Time       `json:"recording_start,omitempty"`
+	DownloadedAt    time.Time       `json:"downloaded_at"`
+	DeleteRequested bool            `json:"delete_requested"`
+	Capture         CaptureMetadata `json:"capture"`
 }
 
 // BufferedFrame is one pre-event frame kept in RAM so recording can include
@@ -351,6 +388,10 @@ type EventRecorder struct {
 
 	HighestSpeed float64
 	Settings     TrackingSettings
+	Capture      CaptureMetadata
+	LumaSum      float64
+	MinLuma      float64
+	MaxLuma      float64
 }
 
 // Source mode names used by flags and the optional startup prompt.

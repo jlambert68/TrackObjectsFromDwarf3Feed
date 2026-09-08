@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -113,6 +114,13 @@ type trackerApp struct {
 	dwarfCameraSelect        *widget.Select
 	dwarfSegmentEntry        *widget.Entry
 	dwarfDownloadDirEntry    *widget.Entry
+	dwarfLatitudeEntry       *widget.Entry
+	dwarfLongitudeEntry      *widget.Entry
+	dwarfAltitudeEntry       *widget.Entry
+	dwarfAzimuthEntry        *widget.Entry
+	dwarfElevationEntry      *widget.Entry
+	dwarfExposureEntry       *widget.Entry
+	dwarfGainEntry           *widget.Entry
 	dwarfDeleteCheck         *widget.Check
 	dwarfDebugWSCheck        *widget.Check
 	showMask                 *widget.Check
@@ -235,6 +243,8 @@ type trackerApp struct {
 	pendingRunStatus        string
 	pendingRunError         error
 	projectRoot             string
+	mediaFilesMu            sync.RWMutex
+	mediaFiles              map[string]string
 	mediaHTTPServer         *http.Server
 	mediaHTTPListener       net.Listener
 	mediaHTTPSServer        *http.Server
@@ -412,26 +422,17 @@ func (ui *trackerApp) stopMediaServer() {
 }
 
 func (ui *trackerApp) serveProjectFile(w http.ResponseWriter, r *http.Request) {
-	requestPath := strings.TrimPrefix(r.URL.Path, "/")
-	cleanPath := filepath.Clean(requestPath)
-	if cleanPath == "." {
+	token := strings.Trim(r.URL.Path, "/")
+	if token == "" || strings.Contains(token, "/") || strings.Contains(token, string(os.PathSeparator)) {
 		http.NotFound(w, r)
 		return
 	}
 
-	fullPath := filepath.Join(ui.projectRoot, cleanPath)
-	absRoot, err := filepath.Abs(ui.projectRoot)
-	if err != nil {
-		http.Error(w, "resolve project root", http.StatusInternalServerError)
-		return
-	}
-	absPath, err := filepath.Abs(fullPath)
-	if err != nil {
-		http.Error(w, "resolve file path", http.StatusBadRequest)
-		return
-	}
-	if absPath != absRoot && !strings.HasPrefix(absPath, absRoot+string(os.PathSeparator)) {
-		http.Error(w, "forbidden", http.StatusForbidden)
+	ui.mediaFilesMu.RLock()
+	absPath, allowed := ui.mediaFiles[token]
+	ui.mediaFilesMu.RUnlock()
+	if !allowed {
+		http.NotFound(w, r)
 		return
 	}
 
@@ -464,15 +465,34 @@ func (ui *trackerApp) projectFileURL(path string) string {
 	if err != nil {
 		return ""
 	}
-	relPath, err := filepath.Rel(absRoot, absPath)
+	resolvedRoot, err := filepath.EvalSymlinks(absRoot)
 	if err != nil {
 		return ""
 	}
-	relPath = filepath.ToSlash(relPath)
-	if strings.HasPrefix(relPath, "../") || relPath == ".." {
+	resolvedPath, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
 		return ""
 	}
-	return ui.mediaServerBaseURL + relPath
+	if resolvedPath != resolvedRoot && !strings.HasPrefix(resolvedPath, resolvedRoot+string(os.PathSeparator)) {
+		return ""
+	}
+	info, err := os.Stat(resolvedPath)
+	if err != nil || !info.Mode().IsRegular() {
+		return ""
+	}
+
+	tokenBytes := make([]byte, 16)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return ""
+	}
+	token := hex.EncodeToString(tokenBytes)
+	ui.mediaFilesMu.Lock()
+	if ui.mediaFiles == nil {
+		ui.mediaFiles = make(map[string]string)
+	}
+	ui.mediaFiles[token] = resolvedPath
+	ui.mediaFilesMu.Unlock()
+	return ui.mediaServerBaseURL + token
 }
 
 type eventHistoryEntry struct {
@@ -530,6 +550,7 @@ type dwarfDownloadRequest struct {
 	queueDir           string
 	recordingName      string
 	recordingStartedAt time.Time
+	capture            CaptureMetadata
 }
 
 type playbackOverlay struct {
@@ -581,8 +602,8 @@ const (
 	sortHighestObjects      = "Highest Object Count"
 	sortHighestPeakSpeed    = "Highest Peak Speed"
 	appID                   = "com.jlambert.dwarf3-event-tracker"
-	mediaServerHost         = "0.0.0.0"
-	mediaServerPublicHost   = "192.168.50.215"
+	mediaServerHost         = "127.0.0.1"
+	mediaServerPublicHost   = "127.0.0.1"
 	mediaServerPortStart    = 8088
 	mediaServerPortEnd      = 8098
 	mediaServerTLSPortStart = 8443
@@ -665,6 +686,7 @@ func main() {
 		ui.showError(fmt.Errorf("start media server: %w", err))
 	}
 	window.SetContent(ui.buildUI())
+	ui.recoverDwarfQueueFromDisk()
 	window.SetCloseIntercept(func() {
 		ui.stopTracking()
 		ui.stopDwarfCapture()
@@ -707,6 +729,13 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 
 	dwarfDownloadDirEntry := widget.NewEntry()
 	dwarfDownloadDirEntry.SetText("dwarf_downloads")
+	dwarfLatitudeEntry := metadataEntry("Latitude (-90..90)")
+	dwarfLongitudeEntry := metadataEntry("Longitude (-180..180)")
+	dwarfAltitudeEntry := metadataEntry("Altitude metres")
+	dwarfAzimuthEntry := metadataEntry("Azimuth degrees")
+	dwarfElevationEntry := metadataEntry("Elevation degrees")
+	dwarfExposureEntry := metadataEntry("Exposure milliseconds")
+	dwarfGainEntry := metadataEntry("Gain")
 
 	dwarfDeleteCheck := widget.NewCheck("Delete remote after download", nil)
 	dwarfDeleteCheck.SetChecked(false)
@@ -852,6 +881,13 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 		dwarfCameraSelect:          dwarfCameraSelect,
 		dwarfSegmentEntry:          dwarfSegmentEntry,
 		dwarfDownloadDirEntry:      dwarfDownloadDirEntry,
+		dwarfLatitudeEntry:         dwarfLatitudeEntry,
+		dwarfLongitudeEntry:        dwarfLongitudeEntry,
+		dwarfAltitudeEntry:         dwarfAltitudeEntry,
+		dwarfAzimuthEntry:          dwarfAzimuthEntry,
+		dwarfElevationEntry:        dwarfElevationEntry,
+		dwarfExposureEntry:         dwarfExposureEntry,
+		dwarfGainEntry:             dwarfGainEntry,
 		dwarfDeleteCheck:           dwarfDeleteCheck,
 		dwarfDebugWSCheck:          dwarfDebugWSCheck,
 		showMask:                   showMask,
@@ -911,6 +947,7 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 		selectedHistory:            -1,
 		presets:                    make(map[string]TrackingSettings),
 		projectRoot:                projectRoot,
+		mediaFiles:                 make(map[string]string),
 		dwarfDownloadedFiles:       make(map[string]DwarfQueuedRecording),
 		playbackSeekFrame:          -1,
 		dwarfRawWSPayload:          "{\n  \"interface\": 10007,\n  \"camId\": 0,\n  \"name\": \"DWARF_TEST_MANUAL\"\n}",
@@ -1114,6 +1151,15 @@ func (ui *trackerApp) buildUI() fyne.CanvasObject {
 			ui.dwarfStatusLabel,
 			ui.dwarfQueueLabel,
 		)),
+		widget.NewAccordionItem("Capture Metadata", widget.NewForm(
+			widget.NewFormItem("Latitude", ui.dwarfLatitudeEntry),
+			widget.NewFormItem("Longitude", ui.dwarfLongitudeEntry),
+			widget.NewFormItem("Altitude (m)", ui.dwarfAltitudeEntry),
+			widget.NewFormItem("Azimuth (°)", ui.dwarfAzimuthEntry),
+			widget.NewFormItem("Elevation (°)", ui.dwarfElevationEntry),
+			widget.NewFormItem("Exposure (ms)", ui.dwarfExposureEntry),
+			widget.NewFormItem("Gain", ui.dwarfGainEntry),
+		)),
 	)
 
 	trackingSettings := widget.NewAccordion(
@@ -1277,6 +1323,12 @@ func sectionTitle(text string) *widget.Label {
 
 func settingField(label string, entry *widget.Entry) fyne.CanvasObject {
 	return container.NewBorder(nil, nil, widget.NewLabel(label), nil, entry)
+}
+
+func metadataEntry(placeholder string) *widget.Entry {
+	entry := widget.NewEntry()
+	entry.SetPlaceHolder(placeholder)
+	return entry
 }
 
 func uiStatusBar(labels ...*widget.Label) fyne.CanvasObject {
@@ -1539,7 +1591,7 @@ func (ui *trackerApp) pickDwarfDownloadFolder() {
 }
 
 func (ui *trackerApp) buildDwarfController() (DwarfController, string, time.Duration, string, error) {
-	segmentSeconds, err := strconv.ParseFloat(ui.dwarfSegmentEntry.Text, 64)
+	segmentSeconds, err := parseRequiredFloat(ui.dwarfSegmentEntry.Text, "DWARF segment seconds")
 	if err != nil || segmentSeconds <= 0 {
 		return DwarfController{}, "", 0, "", errors.New("DWARF segment seconds must be a positive number")
 	}
@@ -1558,6 +1610,107 @@ func (ui *trackerApp) buildDwarfController() (DwarfController, string, time.Dura
 	return controller, dwarfCameraFromLabel(ui.dwarfCameraSelect.Selected), time.Duration(segmentSeconds * float64(time.Second)), downloadDir, nil
 }
 
+func (ui *trackerApp) buildDwarfCaptureMetadata(camera string) (CaptureMetadata, error) {
+	latitude, err := parseOptionalMetadataFloat("latitude", ui.dwarfLatitudeEntry.Text, -90, 90)
+	if err != nil {
+		return CaptureMetadata{}, err
+	}
+	longitude, err := parseOptionalMetadataFloat("longitude", ui.dwarfLongitudeEntry.Text, -180, 180)
+	if err != nil {
+		return CaptureMetadata{}, err
+	}
+	altitude, err := parseOptionalMetadataFloat("altitude", ui.dwarfAltitudeEntry.Text, -500, 10000)
+	if err != nil {
+		return CaptureMetadata{}, err
+	}
+	azimuth, err := parseOptionalMetadataFloat("azimuth", ui.dwarfAzimuthEntry.Text, 0, 360)
+	if err != nil {
+		return CaptureMetadata{}, err
+	}
+	elevation, err := parseOptionalMetadataFloat("elevation", ui.dwarfElevationEntry.Text, -90, 90)
+	if err != nil {
+		return CaptureMetadata{}, err
+	}
+	exposure, err := parseOptionalMetadataFloat("exposure", ui.dwarfExposureEntry.Text, 0, 3600000)
+	if err != nil {
+		return CaptureMetadata{}, err
+	}
+	gain, err := parseOptionalMetadataFloat("gain", ui.dwarfGainEntry.Text, 0, 100000)
+	if err != nil {
+		return CaptureMetadata{}, err
+	}
+
+	locationSource := ""
+	if latitude != nil || longitude != nil || altitude != nil {
+		locationSource = "user"
+	}
+	return CaptureMetadata{
+		Source:         "DWARF 3",
+		Camera:         normalizeDwarfCamera(camera),
+		Latitude:       latitude,
+		Longitude:      longitude,
+		AltitudeM:      altitude,
+		AzimuthDeg:     azimuth,
+		ElevationDeg:   elevation,
+		ExposureMS:     exposure,
+		Gain:           gain,
+		LocationSource: locationSource,
+	}, nil
+}
+
+func parseOptionalMetadataFloat(name, value string, minimum, maximum float64) (*float64, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+		return nil, fmt.Errorf("DWARF %s must be a number", name)
+	}
+	if parsed < minimum || parsed > maximum {
+		return nil, fmt.Errorf("DWARF %s must be between %g and %g", name, minimum, maximum)
+	}
+	return &parsed, nil
+}
+
+func writeDwarfRecordingMetadata(recording DwarfQueuedRecording) error {
+	data, err := json.MarshalIndent(recording, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode DWARF recording metadata: %w", err)
+	}
+	if err := os.WriteFile(recording.LocalPath+".metadata.json", data, 0644); err != nil {
+		return fmt.Errorf("write DWARF recording metadata: %w", err)
+	}
+	return nil
+}
+
+func readDwarfRecordingMetadata(localPath string) (DwarfQueuedRecording, error) {
+	data, err := os.ReadFile(localPath + ".metadata.json")
+	if err != nil {
+		return DwarfQueuedRecording{}, err
+	}
+	var recording DwarfQueuedRecording
+	if err := json.Unmarshal(data, &recording); err != nil {
+		return DwarfQueuedRecording{}, fmt.Errorf("decode DWARF recording metadata for %s: %w", localPath, err)
+	}
+	recording.LocalPath = localPath
+	if recording.RemoteName == "" {
+		recording.RemoteName = filepath.Base(localPath)
+	}
+	if recording.Camera == "" {
+		recording.Camera = dwarfCameraForFileName(recording.RemoteName)
+	}
+	return recording, nil
+}
+
+func dwarfCameraForFileName(name string) string {
+	file := DwarfMediaFile{Name: filepath.Base(name)}
+	if dwarfMediaMatchesCamera(file, dwarfCameraWide) {
+		return dwarfCameraWide
+	}
+	return dwarfCameraTele
+}
+
 func (ui *trackerApp) startDwarfCapture() {
 	ui.mu.Lock()
 	if ui.dwarfCaptureRunning {
@@ -1567,6 +1720,11 @@ func (ui *trackerApp) startDwarfCapture() {
 	ui.mu.Unlock()
 
 	controller, camera, segmentDuration, downloadDir, err := ui.buildDwarfController()
+	if err != nil {
+		ui.showError(err)
+		return
+	}
+	capture, err := ui.buildDwarfCaptureMetadata(camera)
 	if err != nil {
 		ui.showError(err)
 		return
@@ -1585,7 +1743,7 @@ func (ui *trackerApp) startDwarfCapture() {
 	ui.fetchDwarfButton.Disable()
 	ui.dwarfStatusLabel.SetText("DWARF capture starting...")
 
-	go ui.runDwarfCapture(controller, camera, segmentDuration, sessionDir, stopCh)
+	go ui.runDwarfCapture(controller, camera, segmentDuration, sessionDir, capture, stopCh)
 }
 
 func (ui *trackerApp) stopDwarfCapture() {
@@ -1607,12 +1765,21 @@ func (ui *trackerApp) fetchLatestDwarfVideo() {
 		ui.showError(err)
 		return
 	}
+	capture, err := ui.buildDwarfCaptureMetadata(camera)
+	if err != nil {
+		ui.showError(err)
+		return
+	}
 
 	ui.fetchDwarfButton.Disable()
 	ui.dwarfStatusLabel.SetText("Fetching latest DWARF video...")
 
 	go func() {
 		recording, warningText, fetchErr := ui.downloadLatestDwarfVideo(controller, camera, downloadDir, "", time.Time{})
+		recording.Capture = capture
+		if fetchErr == nil {
+			fetchErr = writeDwarfRecordingMetadata(recording)
+		}
 		fyne.Do(func() {
 			ui.fetchDwarfButton.Enable()
 			if fetchErr != nil {
@@ -1764,7 +1931,7 @@ func (ui *trackerApp) runDwarfRawWSCommand(title string, payload string, allowTi
 	}()
 }
 
-func (ui *trackerApp) runDwarfCapture(controller DwarfController, camera string, segmentDuration time.Duration, sessionDir string, stopCh <-chan struct{}) {
+func (ui *trackerApp) runDwarfCapture(controller DwarfController, camera string, segmentDuration time.Duration, sessionDir string, capture CaptureMetadata, stopCh <-chan struct{}) {
 	var runErr error
 	queueDir := dwarfQueueStageDir(sessionDir, dwarfQueueStageQueue)
 	downloadRequests := make(chan dwarfDownloadRequest, 8)
@@ -1837,6 +2004,7 @@ func (ui *trackerApp) runDwarfCapture(controller DwarfController, camera string,
 			queueDir:           queueDir,
 			recordingName:      recordingName,
 			recordingStartedAt: recordingStartedAt,
+			capture:            capture,
 		}
 		select {
 		case downloadRequests <- request:
@@ -1883,6 +2051,14 @@ func (ui *trackerApp) runDwarfDownloadWorker(requests <-chan dwarfDownloadReques
 			fyne.Do(func() {
 				ui.dwarfStatusLabel.SetText("DWARF download failed")
 			})
+			select {
+			case errCh <- err:
+			default:
+			}
+			return
+		}
+		recording.Capture = request.capture
+		if err := writeDwarfRecordingMetadata(recording); err != nil {
 			select {
 			case errCh <- err:
 			default:
@@ -2102,7 +2278,8 @@ func formatDwarfRawWSReport(report DwarfRawWSReport) string {
 }
 
 func selectDwarfMediaFile(files []DwarfMediaFile, downloaded map[string]DwarfQueuedRecording, camera string, recordingName string, recordingStartedAt time.Time) *DwarfMediaFile {
-	if recordingName != "" {
+	hasRecordingIdentity := strings.TrimSpace(recordingName) != "" || !recordingStartedAt.IsZero()
+	if hasRecordingIdentity {
 		for i := range files {
 			if _, seen := downloaded[files[i].Path]; seen {
 				continue
@@ -2111,6 +2288,7 @@ func selectDwarfMediaFile(files []DwarfMediaFile, downloaded map[string]DwarfQue
 				return &files[i]
 			}
 		}
+		return nil
 	}
 
 	for i := range files {
@@ -2149,7 +2327,7 @@ func dwarfMediaMatchesRecording(file DwarfMediaFile, camera string, recordingNam
 
 	if !recordingStartedAt.IsZero() && !file.ModTime.IsZero() {
 		// Fall back to FTP modtime if the filename could not be parsed.
-		if !file.ModTime.Before(recordingStartedAt.Add(-10 * time.Second)) {
+		if !file.ModTime.Before(recordingStartedAt.Add(-10*time.Second)) && file.ModTime.Before(recordingStartedAt.Add(2*time.Minute)) {
 			return true
 		}
 	}
@@ -2252,21 +2430,25 @@ func (ui *trackerApp) processDwarfQueue(stopCh <-chan struct{}) error {
 
 		processingRecording, err := moveDwarfQueuedRecordingToStage(recording, dwarfQueueStageUnderProcessing)
 		if err != nil {
+			ui.prependDwarfFile(recording)
 			return err
 		}
 		ui.updateDownloadedDwarfRecording(processingRecording)
 
-		config, err := ui.buildQueuedDwarfTrackerConfig(processingRecording.LocalPath)
+		config, err := ui.buildQueuedDwarfTrackerConfig(processingRecording)
 		if err != nil {
-			return err
+			return ui.requeueFailedDwarfRecording(processingRecording, err)
 		}
 		if err := ui.executeTracker(config, stopCh); err != nil {
-			return err
+			return ui.requeueFailedDwarfRecording(processingRecording, err)
+		}
+		if stopped(stopCh) {
+			return ui.requeueFailedDwarfRecording(processingRecording, ErrStopTracking)
 		}
 
 		processedRecording, err := moveDwarfQueuedRecordingToStage(processingRecording, dwarfQueueStageProcessed)
 		if err != nil {
-			return err
+			return ui.requeueFailedDwarfRecording(processingRecording, err)
 		}
 		ui.updateDownloadedDwarfRecording(processedRecording)
 
@@ -2303,9 +2485,38 @@ func (ui *trackerApp) finishDwarfQueueProcessing(err error) {
 }
 
 func (ui *trackerApp) updateDownloadedDwarfRecording(recording DwarfQueuedRecording) {
+	if recording.RemotePath == "" {
+		return
+	}
 	ui.mu.Lock()
 	ui.dwarfDownloadedFiles[recording.RemotePath] = recording
 	ui.mu.Unlock()
+}
+
+func (ui *trackerApp) prependDwarfFile(recording DwarfQueuedRecording) {
+	ui.mu.Lock()
+	defer ui.mu.Unlock()
+	for _, queued := range ui.dwarfQueuedFiles {
+		if queued.LocalPath == recording.LocalPath {
+			return
+		}
+	}
+	ui.dwarfQueuedFiles = append([]DwarfQueuedRecording{recording}, ui.dwarfQueuedFiles...)
+}
+
+func (ui *trackerApp) requeueFailedDwarfRecording(recording DwarfQueuedRecording, processErr error) error {
+	queued, moveErr := moveDwarfQueuedRecordingToStage(recording, dwarfQueueStageQueue)
+	if moveErr != nil {
+		ui.prependDwarfFile(recording)
+		return errors.Join(processErr, fmt.Errorf("return failed DWARF recording to queue: %w", moveErr))
+	}
+	metadataErr := writeDwarfRecordingMetadata(queued)
+	ui.updateDownloadedDwarfRecording(queued)
+	ui.prependDwarfFile(queued)
+	if metadataErr != nil {
+		return errors.Join(processErr, metadataErr)
+	}
+	return processErr
 }
 
 func moveDwarfQueuedRecordingToStage(recording DwarfQueuedRecording, stage string) (DwarfQueuedRecording, error) {
@@ -2315,15 +2526,178 @@ func moveDwarfQueuedRecordingToStage(recording DwarfQueuedRecording, stage strin
 	}
 
 	nextPath := filepath.Join(stageDir, filepath.Base(recording.LocalPath))
+	if filepath.Clean(nextPath) == filepath.Clean(recording.LocalPath) {
+		return recording, nil
+	}
+	if _, err := os.Stat(nextPath); err == nil {
+		return DwarfQueuedRecording{}, fmt.Errorf("move dwarf recording to %s: destination already exists: %s", stage, nextPath)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return DwarfQueuedRecording{}, fmt.Errorf("inspect dwarf %s destination: %w", stage, err)
+	}
+	oldMetadataPath := recording.LocalPath + ".metadata.json"
+	newMetadataPath := nextPath + ".metadata.json"
+	_, oldMetadataErr := os.Stat(oldMetadataPath)
+	hasMetadata := oldMetadataErr == nil
+	if oldMetadataErr != nil && !errors.Is(oldMetadataErr, os.ErrNotExist) {
+		return DwarfQueuedRecording{}, fmt.Errorf("inspect dwarf recording metadata: %w", oldMetadataErr)
+	}
+	if hasMetadata {
+		if _, err := os.Stat(newMetadataPath); err == nil {
+			return DwarfQueuedRecording{}, fmt.Errorf("move dwarf metadata to %s: destination already exists: %s", stage, newMetadataPath)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return DwarfQueuedRecording{}, fmt.Errorf("inspect dwarf %s metadata destination: %w", stage, err)
+		}
+	}
 	if err := os.Rename(recording.LocalPath, nextPath); err != nil {
 		return DwarfQueuedRecording{}, fmt.Errorf("move dwarf recording to %s: %w", stage, err)
+	}
+	if hasMetadata {
+		if err := os.Rename(oldMetadataPath, newMetadataPath); err != nil {
+			rollbackErr := os.Rename(nextPath, recording.LocalPath)
+			return DwarfQueuedRecording{}, errors.Join(
+				fmt.Errorf("move dwarf metadata to %s: %w", stage, err),
+				wrapOptionalError("roll back dwarf recording move", rollbackErr),
+			)
+		}
 	}
 	recording.LocalPath = nextPath
 	return recording, nil
 }
 
+func wrapOptionalError(operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", operation, err)
+}
+
 func dwarfQueuedRecordingSessionDir(localPath string) string {
-	return filepath.Dir(filepath.Dir(localPath))
+	parent := filepath.Dir(localPath)
+	switch filepath.Base(parent) {
+	case dwarfQueueStageQueue, dwarfQueueStageUnderProcessing, dwarfQueueStageProcessed:
+		return filepath.Dir(parent)
+	default:
+		return parent
+	}
+}
+
+func recoverDwarfQueuedRecordings(downloadDir string) ([]DwarfQueuedRecording, error) {
+	downloadDir = strings.TrimSpace(downloadDir)
+	if downloadDir == "" {
+		downloadDir = "dwarf_downloads"
+	}
+	if _, err := os.Stat(downloadDir); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("inspect DWARF download directory: %w", err)
+	}
+
+	var candidatePaths []string
+	var scanErrs []error
+	err := filepath.WalkDir(downloadDir, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			scanErrs = append(scanErrs, walkErr)
+			return nil
+		}
+		if entry.IsDir() {
+			if path != downloadDir && filepath.Base(path) == dwarfQueueStageProcessed {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !isVideoFileName(entry.Name()) {
+			return nil
+		}
+
+		stage := filepath.Base(filepath.Dir(path))
+		_, metadataErr := os.Stat(path + ".metadata.json")
+		hasMetadata := metadataErr == nil
+		if metadataErr != nil && !errors.Is(metadataErr, os.ErrNotExist) {
+			scanErrs = append(scanErrs, fmt.Errorf("inspect DWARF metadata for %s: %w", path, metadataErr))
+		}
+		if stage == dwarfQueueStageQueue || stage == dwarfQueueStageUnderProcessing || hasMetadata {
+			candidatePaths = append(candidatePaths, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("scan DWARF download directory: %w", err)
+	}
+
+	recovered := make([]DwarfQueuedRecording, 0, len(candidatePaths))
+	seen := make(map[string]struct{}, len(candidatePaths))
+	for _, path := range candidatePaths {
+		recording, metadataErr := readDwarfRecordingMetadata(path)
+		if metadataErr != nil {
+			if !errors.Is(metadataErr, os.ErrNotExist) {
+				scanErrs = append(scanErrs, metadataErr)
+			}
+			recording = DwarfQueuedRecording{
+				Camera:     dwarfCameraForFileName(path),
+				RemoteName: filepath.Base(path),
+				LocalPath:  path,
+			}
+			if info, statErr := os.Stat(path); statErr == nil {
+				recording.DownloadedAt = info.ModTime()
+			}
+		}
+
+		if filepath.Base(filepath.Dir(path)) == dwarfQueueStageUnderProcessing {
+			queued, moveErr := moveDwarfQueuedRecordingToStage(recording, dwarfQueueStageQueue)
+			if moveErr != nil {
+				scanErrs = append(scanErrs, fmt.Errorf("recover DWARF recording %s: %w", path, moveErr))
+			} else {
+				recording = queued
+				if metadataErr := writeDwarfRecordingMetadata(recording); metadataErr != nil {
+					scanErrs = append(scanErrs, metadataErr)
+				}
+			}
+		}
+
+		cleanPath := filepath.Clean(recording.LocalPath)
+		if _, ok := seen[cleanPath]; ok {
+			continue
+		}
+		seen[cleanPath] = struct{}{}
+		recovered = append(recovered, recording)
+	}
+
+	sort.Slice(recovered, func(i, j int) bool {
+		if recovered[i].DownloadedAt.Equal(recovered[j].DownloadedAt) {
+			return recovered[i].LocalPath < recovered[j].LocalPath
+		}
+		if recovered[i].DownloadedAt.IsZero() {
+			return false
+		}
+		if recovered[j].DownloadedAt.IsZero() {
+			return true
+		}
+		return recovered[i].DownloadedAt.Before(recovered[j].DownloadedAt)
+	})
+	return recovered, errors.Join(scanErrs...)
+}
+
+func (ui *trackerApp) recoverDwarfQueueFromDisk() {
+	recovered, err := recoverDwarfQueuedRecordings(ui.dwarfDownloadDirEntry.Text)
+	if err != nil {
+		logErrorWithContext("recover DWARF queue", err)
+	}
+	if len(recovered) == 0 {
+		return
+	}
+
+	ui.mu.Lock()
+	ui.dwarfQueuedFiles = append(ui.dwarfQueuedFiles, recovered...)
+	for _, recording := range recovered {
+		if recording.RemotePath != "" {
+			ui.dwarfDownloadedFiles[recording.RemotePath] = recording
+		}
+	}
+	queueCount := len(ui.dwarfQueuedFiles)
+	ui.mu.Unlock()
+	ui.dwarfQueueLabel.SetText(fmt.Sprintf("DWARF queue: %d recovered", queueCount))
+	ui.maybeStartDwarfQueueProcessor()
 }
 
 func (ui *trackerApp) startTracking() {
@@ -2538,7 +2912,7 @@ func (ui *trackerApp) formatPlaybackLabelLocked() string {
 }
 
 func (ui *trackerApp) buildConfig() (TrackerConfig, error) {
-	fallbackFPS, err := strconv.ParseFloat(ui.fpsEntry.Text, 64)
+	fallbackFPS, err := parseRequiredFloat(ui.fpsEntry.Text, "Fallback FPS")
 	if err != nil || fallbackFPS <= 0 {
 		return TrackerConfig{}, errors.New("fallback FPS must be a positive number")
 	}
@@ -2576,6 +2950,10 @@ func (ui *trackerApp) buildConfig() (TrackerConfig, error) {
 	if ui.urlEntry.Text == "" {
 		return TrackerConfig{}, errors.New("RTSP URL is required")
 	}
+	capture, err := ui.buildDwarfCaptureMetadata(dwarfCameraFromLabel(ui.dwarfCameraSelect.Selected))
+	if err != nil {
+		return TrackerConfig{}, err
+	}
 
 	return TrackerConfig{
 		Input:        ui.urlEntry.Text,
@@ -2586,10 +2964,11 @@ func (ui *trackerApp) buildConfig() (TrackerConfig, error) {
 		FallbackFPS:  fallbackFPS,
 		Settings:     settings,
 		Nostr:        nostrSettings,
+		Capture:      capture,
 	}, nil
 }
 
-func (ui *trackerApp) buildQueuedDwarfTrackerConfig(videoPath string) (TrackerConfig, error) {
+func (ui *trackerApp) buildQueuedDwarfTrackerConfig(recording DwarfQueuedRecording) (TrackerConfig, error) {
 	settings, err := ui.buildTrackingSettings()
 	if err != nil {
 		return TrackerConfig{}, err
@@ -2605,7 +2984,7 @@ func (ui *trackerApp) buildQueuedDwarfTrackerConfig(videoPath string) (TrackerCo
 	}
 
 	return TrackerConfig{
-		Input:        videoPath,
+		Input:        recording.LocalPath,
 		InputLabel:   "video file",
 		OutputDir:    outputDir,
 		ShowMask:     ui.showMask.Checked,
@@ -2613,11 +2992,12 @@ func (ui *trackerApp) buildQueuedDwarfTrackerConfig(videoPath string) (TrackerCo
 		FallbackFPS:  ui.parseFallbackFPS(),
 		Settings:     settings,
 		Nostr:        nostrSettings,
+		Capture:      recording.Capture,
 	}, nil
 }
 
 func (ui *trackerApp) parseFallbackFPS() float64 {
-	fallbackFPS, err := strconv.ParseFloat(ui.fpsEntry.Text, 64)
+	fallbackFPS, err := parseRequiredFloat(ui.fpsEntry.Text, "Fallback FPS")
 	if err != nil || fallbackFPS <= 0 {
 		return 30
 	}
@@ -3513,6 +3893,9 @@ func (ui *trackerApp) buildTrackingSettings() (TrackingSettings, error) {
 	if settings.MinArea < 0 || settings.MaxArea <= settings.MinArea {
 		return TrackingSettings{}, errors.New("Max Area must be greater than Min Area")
 	}
+	if settings.SlowMinSpeed < 0 || settings.MinSpeed < 0 {
+		return TrackingSettings{}, errors.New("Slow and Fast Min Speed must be non-negative")
+	}
 	if settings.MinSpeed < settings.SlowMinSpeed {
 		return TrackingSettings{}, errors.New("Fast Min Speed must be greater than or equal to Slow Min Speed")
 	}
@@ -3533,6 +3916,15 @@ func (ui *trackerApp) buildTrackingSettings() (TrackingSettings, error) {
 	}
 	if settings.TrackingROIHeightFrac <= 0 || settings.TrackingROIHeightFrac > 1 {
 		return TrackingSettings{}, errors.New("ROI Height Fraction must be in the range (0, 1]")
+	}
+	if settings.MaxMatchDistance <= 0 {
+		return TrackingSettings{}, errors.New("Match Distance must be greater than 0")
+	}
+	if settings.ForegroundThreshold < 0 || settings.ForegroundThreshold > 255 {
+		return TrackingSettings{}, errors.New("Foreground Threshold must be in the range [0, 255]")
+	}
+	if settings.MOG2VarThreshold <= 0 {
+		return TrackingSettings{}, errors.New("MOG2 Var Threshold must be greater than 0")
 	}
 	settings.GenerateObjectGIFs = ui.generateObjectGIFsCheck.Checked
 
@@ -3561,7 +3953,7 @@ func (ui *trackerApp) buildNostrSettings() (NostrSettings, error) {
 	if minDistanceText == "" {
 		minDistanceText = "0"
 	}
-	minDistance, err := strconv.ParseFloat(minDistanceText, 64)
+	minDistance, err := parseRequiredFloat(minDistanceText, "Nostr min straight-line track distance")
 	if err != nil {
 		return NostrSettings{}, errors.New("Nostr min straight-line track distance must be a number")
 	}
@@ -3818,7 +4210,7 @@ func (ui *trackerApp) configureFinalPositionControls(detail *eventHistoryDetail)
 
 	currentThreshold := 0.0
 	if ui.finalPositionDistanceEntry != nil && ui.finalPositionDistanceEntry.Text != "" {
-		if parsed, err := strconv.ParseFloat(ui.finalPositionDistanceEntry.Text, 64); err == nil {
+		if parsed, err := strconv.ParseFloat(ui.finalPositionDistanceEntry.Text, 64); err == nil && isFiniteFloat(parsed) {
 			currentThreshold = parsed
 		}
 	}
@@ -3853,7 +4245,7 @@ func (ui *trackerApp) handleFinalPositionDistanceEntryChanged(value string) {
 		return
 	}
 	parsed, err := strconv.ParseFloat(value, 64)
-	if err != nil {
+	if err != nil || !isFiniteFloat(parsed) {
 		return
 	}
 	ui.applyFinalPositionThreshold(parsed, false)
@@ -3869,7 +4261,7 @@ func (ui *trackerApp) applyFinalPositionThreshold(value float64, updateEntry boo
 	}
 	if updateEntry || ui.finalPositionDistanceEntry.Text == "" {
 		ui.finalPositionDistanceEntry.SetText(formatFloat(value))
-	} else if parsed, err := strconv.ParseFloat(ui.finalPositionDistanceEntry.Text, 64); err == nil && math.Abs(parsed-value) > 0.0001 {
+	} else if parsed, err := strconv.ParseFloat(ui.finalPositionDistanceEntry.Text, 64); err == nil && isFiniteFloat(parsed) && math.Abs(parsed-value) > 0.0001 {
 		ui.finalPositionDistanceEntry.SetText(formatFloat(value))
 	}
 	ui.updatingFinalPositionUI = false
@@ -4869,6 +5261,25 @@ func formatEventDetail(detail eventHistoryDetail, dir string) string {
 		trackingPath = filepath.Join(dir, "tracking.json")
 	}
 	lines = append(lines, fmt.Sprintf("Tracking metadata: %s", trackingPath))
+	if summary.Capture.Source != "" {
+		lines = append(lines, "", "capture metadata:")
+		lines = append(lines, fmt.Sprintf("  Source: %s", summary.Capture.Source))
+		lines = append(lines, fmt.Sprintf("  Camera: %s", strings.ToUpper(summary.Capture.Camera)))
+		lines = appendOptionalMetadataLine(lines, "Latitude", summary.Capture.Latitude, "°")
+		lines = appendOptionalMetadataLine(lines, "Longitude", summary.Capture.Longitude, "°")
+		lines = appendOptionalMetadataLine(lines, "Altitude", summary.Capture.AltitudeM, " m")
+		lines = appendOptionalMetadataLine(lines, "Azimuth", summary.Capture.AzimuthDeg, "°")
+		lines = appendOptionalMetadataLine(lines, "Elevation", summary.Capture.ElevationDeg, "°")
+		lines = appendOptionalMetadataLine(lines, "Exposure", summary.Capture.ExposureMS, " ms")
+		lines = appendOptionalMetadataLine(lines, "Gain", summary.Capture.Gain, "")
+	}
+	if summary.Photometry.Samples > 0 {
+		lines = append(lines, "", "photometry:")
+		lines = append(lines, fmt.Sprintf("  Mean luminance: %.2f", summary.Photometry.MeanLuma))
+		lines = append(lines, fmt.Sprintf("  Min frame luminance: %.2f", summary.Photometry.MinLuma))
+		lines = append(lines, fmt.Sprintf("  Max frame luminance: %.2f", summary.Photometry.MaxLuma))
+		lines = append(lines, fmt.Sprintf("  Samples: %d", summary.Photometry.Samples))
+	}
 
 	lines = append(lines, "")
 	lines = append(lines, "saved tracking settings:")
@@ -4904,6 +5315,13 @@ func formatEventDetail(detail eventHistoryDetail, dir string) string {
 	lines = append(lines, fmt.Sprintf("  Max simultaneous slow tracks: %d", detail.MaxSlowTracks))
 
 	return stringsJoin(lines, "\n")
+}
+
+func appendOptionalMetadataLine(lines []string, label string, value *float64, suffix string) []string {
+	if value == nil {
+		return lines
+	}
+	return append(lines, fmt.Sprintf("  %s: %.6g%s", label, *value, suffix))
 }
 
 func formatObjectOption(object trackedObjectDetail) string {
@@ -4961,6 +5379,9 @@ func formatFloat(value float64) string {
 }
 
 func clampFloat(value, minValue, maxValue float64) float64 {
+	if !isFiniteFloat(value) {
+		return minValue
+	}
 	if value < minValue {
 		return minValue
 	}
@@ -4982,7 +5403,7 @@ func maxTravelDistance(objects []trackedObjectDetail) float64 {
 
 func parseRequiredFloat(value, label string) (float64, error) {
 	parsed, err := strconv.ParseFloat(value, 64)
-	if err != nil {
+	if err != nil || !isFiniteFloat(parsed) {
 		return 0, fmt.Errorf("%s must be a number", label)
 	}
 	return parsed, nil
@@ -5012,7 +5433,7 @@ func parseOptionalFloat(value string) (float64, bool) {
 		return 0, true
 	}
 	parsed, err := strconv.ParseFloat(value, 64)
-	if err != nil {
+	if err != nil || !isFiniteFloat(parsed) {
 		return 0, false
 	}
 	return parsed, true
