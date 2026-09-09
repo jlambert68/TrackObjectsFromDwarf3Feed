@@ -164,6 +164,7 @@ type trackerApp struct {
 	startDwarfButton         *widget.Button
 	stopDwarfButton          *widget.Button
 	fetchDwarfButton         *widget.Button
+	takeDwarfPhotoButton     *widget.Button
 	testDwarfButton          *widget.Button
 	testDwarfRecordButton    *widget.Button
 	rawDwarfWSButton         *widget.Button
@@ -646,6 +647,7 @@ const (
 	dwarfQueueStageQueue           = "queue"
 	dwarfQueueStageUnderProcessing = "UnderProcessing"
 	dwarfQueueStageProcessed       = "Processed"
+	dwarfQueueStageFailed          = "Failed"
 )
 
 func (e eventHistoryEntry) title() string {
@@ -962,6 +964,7 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 	ui.startDwarfButton = widget.NewButtonWithIcon("Start Dwarf", theme.MediaRecordIcon(), ui.startDwarfCapture)
 	ui.stopDwarfButton = widget.NewButtonWithIcon("Stop Dwarf", theme.MediaStopIcon(), ui.stopDwarfCapture)
 	ui.fetchDwarfButton = widget.NewButtonWithIcon("Fetch Latest", theme.DownloadIcon(), ui.fetchLatestDwarfVideo)
+	ui.takeDwarfPhotoButton = widget.NewButtonWithIcon("Take Still Picture", theme.FileImageIcon(), ui.takeDwarfPhoto)
 	ui.testDwarfButton = widget.NewButtonWithIcon("Test Connection", theme.ViewRefreshIcon(), ui.testDwarfConnection)
 	ui.testDwarfRecordButton = widget.NewButtonWithIcon("Test Record Start", theme.MediaRecordIcon(), ui.testDwarfRecordStart)
 	ui.rawDwarfWSButton = widget.NewButtonWithIcon("Raw WS Command", theme.ComputerIcon(), ui.openRawDwarfWSDialog)
@@ -1137,6 +1140,7 @@ func (ui *trackerApp) buildUI() fyne.CanvasObject {
 		ui.startDwarfButton,
 		ui.stopDwarfButton,
 		ui.fetchDwarfButton,
+		ui.takeDwarfPhotoButton,
 		ui.testDwarfButton,
 		ui.testDwarfRecordButton,
 		ui.rawDwarfWSButton,
@@ -1797,6 +1801,79 @@ func (ui *trackerApp) fetchLatestDwarfVideo() {
 	}()
 }
 
+func (ui *trackerApp) takeDwarfPhoto() {
+	ui.mu.Lock()
+	busy := ui.running || ui.dwarfCaptureRunning
+	ui.mu.Unlock()
+	if busy {
+		ui.showError(errors.New("stop the current playback, tracking, or DWARF recording before taking a still picture"))
+		return
+	}
+
+	controller, camera, _, downloadDir, err := ui.buildDwarfController()
+	if err != nil {
+		ui.showError(err)
+		return
+	}
+	ui.takeDwarfPhotoButton.Disable()
+	ui.dwarfStatusLabel.SetText(fmt.Sprintf("Taking DWARF %s still picture...", strings.ToUpper(camera)))
+	capturedAt := time.Now()
+
+	go func() {
+		photo, captureErr := controller.TakePhoto(camera)
+		localPath := ""
+		var displayImage image.Image
+		if captureErr == nil {
+			name := dwarfStillPictureName(photo, capturedAt)
+			localPath = filepath.Join(downloadDir, "Still Pictures", name)
+			captureErr = controller.DownloadPhoto(photo, localPath)
+		}
+		if captureErr == nil {
+			mat := gocv.IMRead(localPath, gocv.IMReadColor)
+			if mat.Empty() {
+				captureErr = fmt.Errorf("downloaded still picture could not be decoded: %s", localPath)
+			} else {
+				displayImage, captureErr = mat.ToImage()
+				if captureErr == nil {
+					displayImage = cloneImage(displayImage)
+				}
+			}
+			mat.Close()
+		}
+
+		fyne.Do(func() {
+			ui.takeDwarfPhotoButton.Enable()
+			if captureErr != nil {
+				ui.dwarfStatusLabel.SetText("DWARF still picture failed")
+				ui.showError(captureErr)
+				return
+			}
+			ui.resetPlaybackControls()
+			ui.videoImage.Image = displayImage
+			ui.videoImage.Refresh()
+			ui.tabs.SelectIndex(0)
+			ui.statusLabel.SetText("Showing DWARF still picture")
+			ui.eventLabel.SetText(localPath)
+			ui.dwarfStatusLabel.SetText(fmt.Sprintf("DWARF still saved: %s", filepath.Base(localPath)))
+		})
+	}()
+}
+
+func dwarfStillPictureName(photo DwarfPhotoFile, fallback time.Time) string {
+	name := filepath.Base(photo.FileName)
+	if name == "." || name == "" {
+		name = filepath.Base(photo.FilePath)
+	}
+	if name == "." || name == "" {
+		name = "DWARF_still.jpg"
+	}
+	capturedAt := fallback
+	if photo.ModificationTime > 0 {
+		capturedAt = time.Unix(photo.ModificationTime, 0)
+	}
+	return capturedAt.Local().Format("2006-01-02_150405") + "_" + name
+}
+
 func (ui *trackerApp) testDwarfConnection() {
 	controller, _, _, _, err := ui.buildDwarfController()
 	if err != nil {
@@ -1962,11 +2039,16 @@ func (ui *trackerApp) runDwarfCapture(controller DwarfController, camera string,
 		}
 
 		recordingName := fmt.Sprintf("DWARF_%s", time.Now().Format("20060102150405"))
-		recordingStartedAt := time.Now()
+		applog.InfofID("89954e83-4cb7-42e9-b4e6-133e0425af0c", "DWARF %s preparing recording %s", strings.ToUpper(camera), recordingName)
 		if _, err := controller.StartVideoRecording(camera, recordingName); err != nil {
 			runErr = err
 			break
 		}
+		// The DWARF can spend longer than the filename-matching tolerance
+		// entering video mode and opening the camera. Record the time at which
+		// start_record was acknowledged, not when that setup began.
+		recordingStartedAt := time.Now()
+		applog.InfofID("f046c14a-3037-4758-b80b-c7380a3772dc", "DWARF %s recording started: %s; segment duration=%s", strings.ToUpper(camera), recordingName, segmentDuration)
 
 		fyne.Do(func() {
 			ui.dwarfStatusLabel.SetText(fmt.Sprintf("DWARF %s recording: %s", strings.ToUpper(camera), recordingName))
@@ -1992,11 +2074,18 @@ func (ui *trackerApp) runDwarfCapture(controller DwarfController, camera string,
 			default:
 			}
 		}
+		// Very short recordings can be rejected while the device is still
+		// creating its media file. This mainly occurs when Stop is clicked just
+		// after start_record is acknowledged.
+		if minimumStopAt := recordingStartedAt.Add(time.Second); time.Now().Before(minimumStopAt) {
+			time.Sleep(time.Until(minimumStopAt))
+		}
 
 		if _, err := controller.StopVideoRecording(camera); err != nil {
 			runErr = err
 			break
 		}
+		applog.InfofID("fc117a8b-a137-45da-863f-3a1bf0fe8038", "DWARF %s recording stopped: %s; elapsed=%s", strings.ToUpper(camera), recordingName, time.Since(recordingStartedAt).Round(time.Millisecond))
 
 		request := dwarfDownloadRequest{
 			controller:         controller,
@@ -2039,6 +2128,7 @@ func (ui *trackerApp) runDwarfDownloadWorker(requests <-chan dwarfDownloadReques
 
 	for request := range requests {
 		time.Sleep(3 * time.Second)
+		applog.InfofID("ce7b8c3d-67a9-4c28-8e27-0bf41e3cb272", "DWARF searching for completed recording %s over FTP", request.recordingName)
 
 		recording, warningText, err := ui.downloadLatestDwarfVideo(
 			request.controller,
@@ -2048,6 +2138,7 @@ func (ui *trackerApp) runDwarfDownloadWorker(requests <-chan dwarfDownloadReques
 			request.recordingStartedAt,
 		)
 		if err != nil {
+			applog.ErrorfID("e0f6a1df-69d7-4640-a171-4cfd9c5f11e3", "DWARF recording download failed: %s: %v", request.recordingName, err)
 			fyne.Do(func() {
 				ui.dwarfStatusLabel.SetText("DWARF download failed")
 			})
@@ -2057,6 +2148,7 @@ func (ui *trackerApp) runDwarfDownloadWorker(requests <-chan dwarfDownloadReques
 			}
 			return
 		}
+		applog.InfofID("7ff4c733-e80d-41f5-8ca7-962841959bbb", "DWARF recording downloaded: remote=%s local=%s", recording.RemotePath, recording.LocalPath)
 		recording.Capture = request.capture
 		if err := writeDwarfRecordingMetadata(recording); err != nil {
 			select {
@@ -2117,7 +2209,7 @@ func (ui *trackerApp) downloadLatestDwarfVideo(controller DwarfController, camer
 	}
 
 	localPath := dwarfDownloadLocalPath(downloadDir, recordingName, selected.Path)
-	if err := controller.DownloadFile(selected.Path, localPath); err != nil {
+	if err := downloadValidatedDwarfVideo(controller, selected.Path, localPath); err != nil {
 		return DwarfQueuedRecording{}, "", err
 	}
 
@@ -2170,7 +2262,7 @@ func dwarfQueueStageDir(sessionDir string, stage string) string {
 func findDwarfMediaFileForDownload(controller DwarfController, downloaded map[string]DwarfQueuedRecording, camera string, recordingName string, recordingStartedAt time.Time) (*DwarfMediaFile, error) {
 	waitUntil := time.Now()
 	if recordingName != "" {
-		waitUntil = waitUntil.Add(90 * time.Second)
+		waitUntil = waitUntil.Add(15 * time.Second)
 	}
 
 	for {
@@ -2185,7 +2277,15 @@ func findDwarfMediaFileForDownload(controller DwarfController, downloaded map[st
 		}
 
 		if recordingName == "" || time.Now().After(waitUntil) {
-			return nil, nil
+			// DWARF firmware chooses the actual filename and some versions report
+			// FTP timestamps in a different timezone. If strict name/timestamp
+			// matching expires, fall back to the newest file for the requested
+			// camera that this application has not downloaded yet.
+			fallback := selectDwarfMediaFile(files, downloaded, camera, "", time.Time{})
+			if fallback != nil {
+				applog.InfofID("99b9e8aa-39ce-4198-829b-171838a9ab8a", "DWARF strict match expired for %s; using newest unseen %s file: %s", recordingName, strings.ToUpper(camera), fallback.Path)
+			}
+			return fallback, nil
 		}
 
 		time.Sleep(3 * time.Second)
@@ -2428,6 +2528,20 @@ func (ui *trackerApp) processDwarfQueue(stopCh <-chan struct{}) error {
 			ui.statusLabel.SetText("Processing queued DWARF video...")
 		})
 
+		if validationErr := validateDwarfVideoFile(recording.LocalPath); validationErr != nil {
+			failedRecording, quarantineErr := quarantineDwarfQueuedRecording(recording, validationErr)
+			if quarantineErr != nil {
+				ui.prependDwarfFile(recording)
+				return quarantineErr
+			}
+			ui.updateDownloadedDwarfRecording(failedRecording)
+			applog.InfofID("64b9846e-bb59-4b74-b9b8-81f0fd473f6c", "DWARF recording moved to Failed: file=%s reason=%v", failedRecording.LocalPath, validationErr)
+			fyne.Do(func() {
+				ui.dwarfStatusLabel.SetText(fmt.Sprintf("DWARF skipped damaged video: %s", filepath.Base(failedRecording.LocalPath)))
+			})
+			continue
+		}
+
 		processingRecording, err := moveDwarfQueuedRecordingToStage(recording, dwarfQueueStageUnderProcessing)
 		if err != nil {
 			ui.prependDwarfFile(recording)
@@ -2519,6 +2633,20 @@ func (ui *trackerApp) requeueFailedDwarfRecording(recording DwarfQueuedRecording
 	return processErr
 }
 
+func quarantineDwarfQueuedRecording(recording DwarfQueuedRecording, cause error) (DwarfQueuedRecording, error) {
+	if cause != nil {
+		recording.FailureReason = cause.Error()
+	}
+	failed, err := moveDwarfQueuedRecordingToStage(recording, dwarfQueueStageFailed)
+	if err != nil {
+		return DwarfQueuedRecording{}, fmt.Errorf("move damaged DWARF recording to Failed: %w", err)
+	}
+	if err := writeDwarfRecordingMetadata(failed); err != nil {
+		return DwarfQueuedRecording{}, err
+	}
+	return failed, nil
+}
+
 func moveDwarfQueuedRecordingToStage(recording DwarfQueuedRecording, stage string) (DwarfQueuedRecording, error) {
 	stageDir := dwarfQueueStageDir(dwarfQueuedRecordingSessionDir(recording.LocalPath), stage)
 	if err := os.MkdirAll(stageDir, 0o755); err != nil {
@@ -2574,7 +2702,7 @@ func wrapOptionalError(operation string, err error) error {
 func dwarfQueuedRecordingSessionDir(localPath string) string {
 	parent := filepath.Dir(localPath)
 	switch filepath.Base(parent) {
-	case dwarfQueueStageQueue, dwarfQueueStageUnderProcessing, dwarfQueueStageProcessed:
+	case dwarfQueueStageQueue, dwarfQueueStageUnderProcessing, dwarfQueueStageProcessed, dwarfQueueStageFailed:
 		return filepath.Dir(parent)
 	default:
 		return parent
@@ -2601,7 +2729,8 @@ func recoverDwarfQueuedRecordings(downloadDir string) ([]DwarfQueuedRecording, e
 			return nil
 		}
 		if entry.IsDir() {
-			if path != downloadDir && filepath.Base(path) == dwarfQueueStageProcessed {
+			stage := filepath.Base(path)
+			if path != downloadDir && (stage == dwarfQueueStageProcessed || stage == dwarfQueueStageFailed) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -2641,6 +2770,19 @@ func recoverDwarfQueuedRecordings(downloadDir string) ([]DwarfQueuedRecording, e
 			if info, statErr := os.Stat(path); statErr == nil {
 				recording.DownloadedAt = info.ModTime()
 			}
+		}
+
+		if validationErr := validateDwarfVideoFile(path); validationErr != nil {
+			failed, quarantineErr := quarantineDwarfQueuedRecording(recording, validationErr)
+			if quarantineErr != nil {
+				scanErrs = append(scanErrs, errors.Join(
+					fmt.Errorf("validate DWARF recording %s: %w", path, validationErr),
+					quarantineErr,
+				))
+				continue
+			}
+			applog.InfofID("64b9846e-bb59-4b74-b9b8-81f0fd473f6c", "DWARF recording moved to Failed during recovery: file=%s reason=%v", failed.LocalPath, validationErr)
+			continue
 		}
 
 		if filepath.Base(filepath.Dir(path)) == dwarfQueueStageUnderProcessing {

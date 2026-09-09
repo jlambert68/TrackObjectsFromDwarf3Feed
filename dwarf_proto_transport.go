@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"dwarf3-event-tracker/internal/applog"
@@ -21,6 +22,8 @@ const (
 	dwarfDefaultWSClientID      = ""
 	dwarfDefaultWSPingInterval  = 5 * time.Second
 	dwarfDefaultWSRequestTimout = 10 * time.Second
+	dwarfWSConnectAttempts      = 4
+	dwarfWSConnectRetryDelay    = 2 * time.Second
 )
 
 func defaultDwarfWSClientID() string {
@@ -138,7 +141,16 @@ func (t *DwarfProtoTransport) Connect() error {
 	}
 	config.Dialer = &net.Dialer{Timeout: t.timeout}
 
-	conn, err := websocket.DialConfig(config)
+	conn, err := dialDwarfWebSocketWithRetry(
+		config,
+		dwarfWSConnectAttempts,
+		dwarfWSConnectRetryDelay,
+		websocket.DialConfig,
+		time.Sleep,
+		func(nextAttempt, attempts int, delay time.Duration, dialErr error) {
+			t.log("PROTO CONNECT RETRY %s attempt=%d/%d delay=%s err=%v", t.url, nextAttempt, attempts, delay, dialErr)
+		},
+	)
 	if err != nil {
 		return fmt.Errorf("dial protobuf websocket: %w", err)
 	}
@@ -157,6 +169,49 @@ func (t *DwarfProtoTransport) Connect() error {
 	t.log("PROTO CONNECT %s client=%s", t.url, t.config.ClientID)
 	go t.runPingLoop(conn, t.closed, t.pingDone)
 	return nil
+}
+
+func dialDwarfWebSocketWithRetry(
+	config *websocket.Config,
+	attempts int,
+	retryDelay time.Duration,
+	dial func(*websocket.Config) (*websocket.Conn, error),
+	wait func(time.Duration),
+	onRetry func(nextAttempt, attempts int, delay time.Duration, err error),
+) (*websocket.Conn, error) {
+	if attempts < 1 {
+		attempts = 1
+	}
+	if wait == nil {
+		wait = time.Sleep
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		conn, err := dial(config)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		if !isDwarfWebSocketConnectionRefused(err) || attempt == attempts {
+			return nil, err
+		}
+		if onRetry != nil {
+			onRetry(attempt+1, attempts, retryDelay, err)
+		}
+		wait(retryDelay)
+	}
+	return nil, lastErr
+}
+
+func isDwarfWebSocketConnectionRefused(err error) bool {
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return true
+	}
+	// x/net/websocket.DialError predates Go error unwrapping and exposes the
+	// underlying network error through Err instead of Unwrap.
+	var websocketDialErr *websocket.DialError
+	return errors.As(err, &websocketDialErr) && errors.Is(websocketDialErr.Err, syscall.ECONNREFUSED)
 }
 
 func (t *DwarfProtoTransport) Close() error {
@@ -244,14 +299,19 @@ func (t *DwarfProtoTransport) SendBinaryCommand(command DwarfProtoCommand, allow
 	for {
 		var response []byte
 		if err := websocket.Message.Receive(conn, &response); err != nil {
-			t.log("PROTO RECV ERROR %s id=%d err=%v", t.url, command.RequestID, err)
 			if allowTimeoutSuccess && isNetTimeout(err) {
+				// Several DWARF setup commands complete through state-change
+				// notifications without returning a matching command response. This
+				// timeout is the expected end of a best-effort request, not a device
+				// or transport failure.
+				t.log("PROTO NO MATCHING REPLY %s id=%d cmd=%d name=%s; continuing after best-effort timeout", t.url, command.RequestID, command.Cmd, command.Name)
 				return &DwarfProtoCommandResult{
 					Command:       command,
 					SentAt:        sentAt,
 					TimeoutMasked: true,
 				}, nil
 			}
+			t.log("PROTO RECV ERROR %s id=%d err=%v", t.url, command.RequestID, err)
 			return nil, fmt.Errorf("read protobuf websocket response: %w", err)
 		}
 

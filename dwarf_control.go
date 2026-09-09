@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/textproto"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -34,9 +36,11 @@ const (
 
 const (
 	dwarfProtoTeleOpenCameraCmd  = 10000
+	dwarfProtoTelePhotographCmd  = 10002
 	dwarfProtoTeleStartRecordCmd = 10005
 	dwarfProtoTeleStopRecordCmd  = 10006
 	dwarfProtoWideOpenCameraCmd  = 12000
+	dwarfProtoWidePhotographCmd  = 12022
 	dwarfProtoWideStartRecordCmd = 12030
 	dwarfProtoWideStopRecordCmd  = 12031
 	dwarfProtoTaskSwitchModeCmd  = 16402
@@ -56,12 +60,29 @@ const (
 )
 
 const (
-	dwarfShootingModeVideo = 1
+	dwarfShootingModeVideo  = 1
+	dwarfShootingModeNormal = 1
 )
 
 const (
-	dwarfShootingTechVideo = 4
+	dwarfShootingTechVideo      = 4
+	dwarfShootingTechSingleShot = 1
 )
+
+type DwarfPhotoFile struct {
+	FileName         string `json:"fileName"`
+	FilePath         string `json:"filePath"`
+	FileSize         int64  `json:"fileSize"`
+	MediaType        int    `json:"mediaType"`
+	ModificationTime int64  `json:"modificationTime"`
+	CameraID         int    `json:"camId"`
+}
+
+type dwarfAlbumResponse struct {
+	Data []DwarfPhotoFile `json:"data"`
+	Code int              `json:"code"`
+	Msg  string           `json:"msg"`
+}
 
 type DwarfController struct {
 	Host             string
@@ -178,6 +199,126 @@ func (c DwarfController) StartVideoRecording(camera, name string) (*DwarfCommand
 	defer transport.Close()
 
 	return c.startVideoRecordingSession(transport, camera, name)
+}
+
+// TakePhoto switches the selected camera to single-shot mode, takes one photo,
+// and returns the new album entry once the device has finished saving it.
+func (c DwarfController) TakePhoto(camera string) (DwarfPhotoFile, error) {
+	before, err := c.ListPhotoFiles()
+	if err != nil {
+		return DwarfPhotoFile{}, fmt.Errorf("list photos before capture: %w", err)
+	}
+	known := make(map[string]struct{}, len(before))
+	for _, file := range before {
+		known[file.FilePath] = struct{}{}
+	}
+
+	transport := newDwarfProtoTransport(c)
+	defer transport.Close()
+	commands := []DwarfProtoCommand{
+		{RequestID: transport.NextRequestID(), Cmd: dwarfProtoTaskEnterCameraCmd, DeviceID: dwarfProtoDefaultDeviceID, Name: "enter_camera", Payload: encodeProtoEnterCamera(dwarfProtoDefaultEncodeType)},
+		{RequestID: transport.NextRequestID(), Cmd: dwarfProtoOpenCameraCmd(camera), DeviceID: dwarfProtoDefaultDeviceID, Name: "open_camera", Payload: encodeProtoOpenCamera(camera, false, dwarfProtoDefaultEncodeType)},
+		{RequestID: transport.NextRequestID(), Cmd: dwarfProtoTaskSwitchModeCmd, DeviceID: dwarfProtoDefaultDeviceID, Name: "switch_shooting_mode", Payload: encodeProtoSwitchShootingMode(dwarfShootingModeNormal)},
+		{RequestID: transport.NextRequestID(), Cmd: dwarfProtoTaskSwitchTechCmd, DeviceID: dwarfProtoDefaultDeviceID, Name: "switch_shooting_tech", Payload: encodeProtoSwitchShootingTech(dwarfShootingTechSingleShot)},
+	}
+	for _, command := range commands {
+		if _, err := c.sendProtoCommandBestEffort(transport, command); err != nil {
+			return DwarfPhotoFile{}, err
+		}
+	}
+	time.Sleep(500 * time.Millisecond)
+	if _, err := c.sendProtoCommand(transport, DwarfProtoCommand{
+		RequestID: transport.NextRequestID(), Cmd: dwarfProtoPhotographCmd(camera), DeviceID: dwarfProtoDefaultDeviceID, Name: "take_photo",
+	}); err != nil {
+		return DwarfPhotoFile{}, err
+	}
+
+	deadline := time.Now().Add(c.timeout() + 10*time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(750 * time.Millisecond)
+		files, listErr := c.ListPhotoFiles()
+		if listErr != nil {
+			continue
+		}
+		var newest DwarfPhotoFile
+		for _, file := range files {
+			if _, existed := known[file.FilePath]; existed {
+				continue
+			}
+			if newest.FilePath == "" {
+				newest = file
+			}
+			if file.CameraID == dwarfCameraID(camera) {
+				return file, nil
+			}
+		}
+		// Some firmware versions omit camId. There can only be one new item from
+		// this operation, so use it when no camera-specific entry was returned.
+		if newest.FilePath != "" {
+			return newest, nil
+		}
+	}
+	return DwarfPhotoFile{}, errors.New("photo was accepted but no new image appeared in the DWARF album")
+}
+
+func (c DwarfController) ListPhotoFiles() ([]DwarfPhotoFile, error) {
+	body := strings.NewReader(`{"mediaType":0,"pageIndex":0,"pageSize":100}`)
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s:8082/album/list/mediaInfos", c.host()), body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: c.timeout()}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("album returned HTTP %d", resp.StatusCode)
+	}
+	var result dwarfAlbumResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	if result.Code != 0 {
+		return nil, fmt.Errorf("album returned code %d: %s", result.Code, result.Msg)
+	}
+	sort.Slice(result.Data, func(i, j int) bool { return result.Data[i].ModificationTime > result.Data[j].ModificationTime })
+	return result.Data, nil
+}
+
+func (c DwarfController) DownloadPhoto(file DwarfPhotoFile, localPath string) error {
+	remoteURL := "http://" + c.host() + encodeDwarfDevicePath(file.FilePath)
+	resp, err := (&http.Client{Timeout: c.timeout() + 20*time.Second}).Get(remoteURL)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("download photo returned HTTP %d", resp.StatusCode)
+	}
+	if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
+		return err
+	}
+	out, err := os.Create(localPath)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(out, resp.Body)
+	closeErr := out.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
+}
+
+func encodeDwarfDevicePath(devicePath string) string {
+	parts := strings.Split("/"+strings.TrimLeft(devicePath, "/"), "/")
+	for i := range parts {
+		parts[i] = url.PathEscape(parts[i])
+	}
+	return strings.Join(parts, "/")
 }
 
 func (c DwarfController) startVideoRecordingSession(transport *DwarfProtoTransport, camera, name string) (*DwarfCommandResponse, error) {
@@ -640,6 +781,15 @@ func dwarfProtoOpenCameraCmd(camera string) uint32 {
 		return dwarfProtoWideOpenCameraCmd
 	default:
 		return dwarfProtoTeleOpenCameraCmd
+	}
+}
+
+func dwarfProtoPhotographCmd(camera string) uint32 {
+	switch normalizeDwarfCamera(camera) {
+	case dwarfCameraWide:
+		return dwarfProtoWidePhotographCmd
+	default:
+		return dwarfProtoTelePhotographCmd
 	}
 }
 

@@ -71,6 +71,98 @@ func TestClassifyTrackAcceptsRealMotion(t *testing.T) {
 	}
 }
 
+func TestClassifyTrackHonorsTwoHitSetting(t *testing.T) {
+	settings := DefaultTrackingSettings()
+	settings.MinHits = 2
+	track := &Track{
+		Hits:  2,
+		Speed: 900,
+		Trail: []image.Point{
+			{X: 100, Y: 500},
+			{X: 125, Y: 470},
+		},
+	}
+
+	trackType, ok := classifyTrack(track, settings)
+	if !ok {
+		t.Fatal("expected a two-frame fast track to be accepted when MinHits is 2")
+	}
+	if trackType != trackTypeFast {
+		t.Fatalf("expected fast track, got %s", trackType)
+	}
+}
+
+func TestScoreTrackDetectionMatchAllowsMotionBlurScaleChange(t *testing.T) {
+	settings := DefaultTrackingSettings()
+	track := &Track{
+		Rect: image.Rect(80, 80, 120, 120),
+		Hits: settings.MinHits * 2,
+	}
+	detection := Detection{
+		Rect:   image.Rect(75, 55, 175, 155),
+		Center: image.Pt(125, 105),
+	}
+
+	if _, ok := scoreTrackDetectionMatch(track, detection, 100, 100, settings); !ok {
+		t.Fatal("expected a nearby motion-blurred detection to tolerate a linear scale change")
+	}
+}
+
+func TestTrackDetectionMatchDistanceScalesWithObjectSize(t *testing.T) {
+	settings := DefaultTrackingSettings()
+	largeTrack := &Track{
+		Rect:     image.Rect(60, 60, 140, 140),
+		Position: image.Pt(100, 100),
+	}
+	largeDetection := Detection{
+		Rect:   image.Rect(190, 60, 270, 140),
+		Center: image.Pt(230, 100),
+	}
+	if _, ok := scoreTrackDetectionMatch(largeTrack, largeDetection, 100, 100, settings); !ok {
+		t.Fatal("expected a large object to receive a size-aware match allowance")
+	}
+
+	smallTrack := &Track{
+		Rect:     image.Rect(96, 96, 104, 104),
+		Position: image.Pt(100, 100),
+	}
+	smallDetection := Detection{
+		Rect:   image.Rect(226, 96, 234, 104),
+		Center: image.Pt(230, 100),
+	}
+	if _, ok := scoreTrackDetectionMatch(smallTrack, smallDetection, 100, 100, settings); ok {
+		t.Fatal("expected the same jump to remain out of range for a small object")
+	}
+}
+
+func TestLargeFastObjectBecomesVisibleAfterConfiguredTwoHits(t *testing.T) {
+	settings := DefaultTrackingSettings()
+	settings.MinHits = 2
+	settings.MaxMatchDistance = 100
+	frameDT := 1.0 / 30.0
+	started := time.Unix(1_700_000_000, 0)
+
+	tracks, nextID := updateTracks(nil, []Detection{{
+		Rect:   image.Rect(60, 60, 140, 140),
+		Center: image.Pt(100, 100),
+	}}, started, frameDT, 1, settings)
+	tracks, nextID = updateTracks(tracks, []Detection{{
+		Rect:   image.Rect(190, 60, 270, 140),
+		Center: image.Pt(230, 100),
+	}}, started.Add(time.Second/30), frameDT, nextID, settings)
+
+	if len(tracks) != 1 || nextID != 2 {
+		t.Fatalf("expected one continuous track, got tracks=%d nextID=%d", len(tracks), nextID)
+	}
+	if tracks[0].ID != 1 || tracks[0].Hits != 2 {
+		t.Fatalf("fast object was split instead of matched: %+v", tracks[0])
+	}
+	metadata := makeFrameMetadata(2, started, started.Add(time.Second/30), tracks, settings)
+	if len(metadata.Tracks) != 1 || metadata.Tracks[0].ID != 1 {
+		t.Fatalf("expected the two-hit fast object in frame metadata, got %+v", metadata.Tracks)
+	}
+}
+
 func TestNormalizeTrackingSettingsPreservesAcceptedZeroValues(t *testing.T) {
 	settings := DefaultTrackingSettings()
 	settings.MinArea = 0

@@ -25,6 +25,28 @@ func TestDwarfMediaMatchesRecordingByTimestamp(t *testing.T) {
 	}
 }
 
+func TestDwarfStillPictureNameIncludesDatetime(t *testing.T) {
+	capturedAt := time.Date(2026, time.September, 9, 14, 35, 12, 0, time.Local)
+	photo := DwarfPhotoFile{FileName: "DWARF3_WIDE.jpg"}
+
+	got := dwarfStillPictureName(photo, capturedAt)
+	want := "2026-09-09_143512_DWARF3_WIDE.jpg"
+	if got != want {
+		t.Fatalf("still picture name = %q, want %q", got, want)
+	}
+}
+
+func TestDwarfStillPictureNameUsesDeviceModificationTime(t *testing.T) {
+	deviceTime := time.Date(2026, time.September, 9, 14, 36, 20, 0, time.Local)
+	photo := DwarfPhotoFile{FilePath: "/DWARF3/Photos/still.jpg", ModificationTime: deviceTime.Unix()}
+
+	got := dwarfStillPictureName(photo, time.Date(2000, time.January, 1, 0, 0, 0, 0, time.Local))
+	want := "2026-09-09_143620_still.jpg"
+	if got != want {
+		t.Fatalf("still picture name = %q, want %q", got, want)
+	}
+}
+
 func TestSelectDwarfMediaFileSkipsDownloadedAndUsesCameraFallback(t *testing.T) {
 	files := []DwarfMediaFile{
 		{
@@ -64,6 +86,18 @@ func TestSelectDwarfMediaFileDoesNotFallbackForNamedRecording(t *testing.T) {
 	selected := selectDwarfMediaFile(files, nil, dwarfCameraTele, "DWARF_20260821150000", startedAt)
 	if selected != nil {
 		t.Fatalf("selected unrelated fallback while requested recording was still absent: %+v", selected)
+	}
+}
+
+func TestSelectDwarfMediaFileFallbackUsesNewestUnseenCameraFile(t *testing.T) {
+	files := []DwarfMediaFile{
+		{Path: "/Videos/DWARF3_TELE_2026-09-09-19-49-13-121.mp4", Name: "DWARF3_TELE_2026-09-09-19-49-13-121.mp4"},
+		{Path: "/Videos/DWARF3_WIDE_2026-09-09-19-49-13-121.mp4", Name: "DWARF3_WIDE_2026-09-09-19-49-13-121.mp4"},
+	}
+
+	selected := selectDwarfMediaFile(files, nil, dwarfCameraTele, "", time.Time{})
+	if selected == nil || selected.Path != files[0].Path {
+		t.Fatalf("camera fallback selected %+v", selected)
 	}
 }
 
@@ -196,9 +230,7 @@ func TestRecoverDwarfQueuedRecordingsReturnsUnderProcessingFileToQueue(t *testin
 		t.Fatalf("create under-processing directory: %v", err)
 	}
 	videoPath := filepath.Join(underProcessingDir, "DWARF3_WIDE_2026-09-08-12-00-00-000.mp4")
-	if err := os.WriteFile(videoPath, []byte("video"), 0o644); err != nil {
-		t.Fatalf("write video: %v", err)
-	}
+	writeTestMP4(t, videoPath, "ftyp", "mdat", "moov")
 	latitude := 59.3293
 	recording := DwarfQueuedRecording{
 		Camera:       dwarfCameraWide,
@@ -235,6 +267,43 @@ func TestRecoverDwarfQueuedRecordingsReturnsUnderProcessingFileToQueue(t *testin
 	}
 	if _, err := os.Stat(videoPath); !os.IsNotExist(err) {
 		t.Fatalf("under-processing video still exists, stat error=%v", err)
+	}
+}
+
+func TestRecoverDwarfQueuedRecordingsQuarantinesDamagedMP4(t *testing.T) {
+	downloadDir := t.TempDir()
+	sessionDir := filepath.Join(downloadDir, "2026-09-09_180000")
+	queueDir := filepath.Join(sessionDir, dwarfQueueStageQueue)
+	damagedPath := filepath.Join(queueDir, "damaged.mp4")
+	completePath := filepath.Join(queueDir, "complete.mp4")
+	writeTestMP4(t, damagedPath, "ftyp", "mdat")
+	writeTestMP4(t, completePath, "ftyp", "mdat", "moov")
+	for _, recording := range []DwarfQueuedRecording{
+		{LocalPath: damagedPath, RemotePath: "/Videos/damaged.mp4", DownloadedAt: time.Now().Add(-time.Minute)},
+		{LocalPath: completePath, RemotePath: "/Videos/complete.mp4", DownloadedAt: time.Now()},
+	} {
+		if err := writeDwarfRecordingMetadata(recording); err != nil {
+			t.Fatalf("write metadata: %v", err)
+		}
+	}
+
+	recovered, err := recoverDwarfQueuedRecordings(downloadDir)
+	if err != nil {
+		t.Fatalf("recover queue: %v", err)
+	}
+	if len(recovered) != 1 || recovered[0].LocalPath != completePath {
+		t.Fatalf("unexpected recovered recordings: %+v", recovered)
+	}
+	failedPath := filepath.Join(sessionDir, dwarfQueueStageFailed, filepath.Base(damagedPath))
+	if _, err := os.Stat(failedPath); err != nil {
+		t.Fatalf("damaged recording was not quarantined: %v", err)
+	}
+	failed, err := readDwarfRecordingMetadata(failedPath)
+	if err != nil {
+		t.Fatalf("read failed metadata: %v", err)
+	}
+	if !strings.Contains(failed.FailureReason, "moov") {
+		t.Fatalf("unexpected failure reason: %q", failed.FailureReason)
 	}
 }
 

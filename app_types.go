@@ -354,6 +354,7 @@ type DwarfQueuedRecording struct {
 	RecordingStart  time.Time       `json:"recording_start,omitempty"`
 	DownloadedAt    time.Time       `json:"downloaded_at"`
 	DeleteRequested bool            `json:"delete_requested"`
+	FailureReason   string          `json:"failure_reason,omitempty"`
 	Capture         CaptureMetadata `json:"capture"`
 }
 

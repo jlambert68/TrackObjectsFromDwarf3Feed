@@ -92,6 +92,23 @@ func TestDefaultDwarfControllerUsesVideosRoot(t *testing.T) {
 	}
 }
 
+func TestDwarfProtoPhotographCmdUsesSelectedCamera(t *testing.T) {
+	if got := dwarfProtoPhotographCmd(dwarfCameraTele); got != dwarfProtoTelePhotographCmd {
+		t.Fatalf("tele photograph command = %d", got)
+	}
+	if got := dwarfProtoPhotographCmd(dwarfCameraWide); got != dwarfProtoWidePhotographCmd {
+		t.Fatalf("wide photograph command = %d", got)
+	}
+}
+
+func TestEncodeDwarfDevicePath(t *testing.T) {
+	got := encodeDwarfDevicePath("/DWARF3/Photos/My still #1.jpg")
+	want := "/DWARF3/Photos/My%20still%20%231.jpg"
+	if got != want {
+		t.Fatalf("encoded path = %q, want %q", got, want)
+	}
+}
+
 func TestDwarfFTPReadResponseDoesNotMatchExpectedCodeInMessage(t *testing.T) {
 	conn := &testReadWriteCloser{reader: strings.NewReader("500 331 login required\r\n")}
 

@@ -116,3 +116,29 @@ go run . -source=file -file /path/to/video.mp4
 
 The same detection, tracking, prebuffer, dual-video recording, and JSON metadata
 pipeline is used for both input types.
+
+## Live DWARF integration tests
+
+The live-device tests are disabled during normal `go test` runs. Connect the
+computer to the DWARF, close capture modes in the DWARFLAB app, and run:
+
+```bash
+RUN_DWARF_INTEGRATION=1 \
+DWARF_HOST=192.168.50.136 \
+DWARF_CAMERA=wide \
+go test -count=1 -timeout=3m -run '^TestDwarfIntegration' .
+```
+
+The suite checks WebSocket and FTP connectivity, takes and downloads a still
+picture through the album API, records a short video, lists it over FTP, and
+downloads it while checking the reported file size. Use `DWARF_CAMERA=tele` to
+test the telephoto camera. Optional settings are:
+
+- `DWARF_RECORD_WAIT_SECONDS=6` changes the test recording duration.
+- `DWARF_TIMEOUT_SECONDS=20`, `DWARF_WS_PORT`, and `DWARF_FTP_PORT` override connection settings.
+- `DWARF_DEBUG_WS=1` enables protocol logging.
+- `DWARF_DELETE_TEST_MEDIA=1` also deletes the video created by the test and verifies its removal.
+- `DWARF_RAW_WS_PAYLOAD='{"clientId":"DAF3","type":"ping"}'` runs the raw WebSocket test; add `DWARF_RAW_WS_ALLOW_TIMEOUT=1` for commands whose success has no reply.
+
+The still picture and, unless deletion is enabled, the short video remain in
+the DWARF album after the test.

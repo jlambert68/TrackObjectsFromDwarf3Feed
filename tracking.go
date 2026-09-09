@@ -284,7 +284,8 @@ func scoreTrackDetectionMatch(track *Track, detection Detection, predictedX, pre
 	dx := float64(detection.Center.X) - predictedX
 	dy := float64(detection.Center.Y) - predictedY
 	distance := math.Hypot(dx, dy)
-	if distance > settings.MaxMatchDistance {
+	matchDistance := trackDetectionMatchDistance(track.Rect, detection.Rect, settings.MaxMatchDistance)
+	if distance > matchDistance {
 		return 0, false
 	}
 
@@ -294,31 +295,44 @@ func scoreTrackDetectionMatch(track *Track, detection Detection, predictedX, pre
 		return 0, false
 	}
 
-	areaRatio := detectionArea / trackArea
-	if areaRatio < 1 {
-		areaRatio = 1 / areaRatio
+	scaleRatio := math.Sqrt(detectionArea / trackArea)
+	if scaleRatio < 1 {
+		scaleRatio = 1 / scaleRatio
 	}
 
 	iou := rectIOU(track.Rect, detection.Rect)
 
 	// Once a track is established, reject candidates whose size changes too
 	// violently unless the boxes still overlap enough to justify the jump.
-	if track.Hits >= settings.MinHits*2 && areaRatio > 4.0 && iou < 0.08 {
+	if track.Hits >= settings.MinHits*2 && scaleRatio > 3.0 && iou < 0.08 {
 		return 0, false
 	}
 
-	distanceScore := distance / settings.MaxMatchDistance
-	sizePenalty := math.Max(0, areaRatio-1.0) * 0.20
+	distanceScore := distance / matchDistance
+	sizePenalty := math.Max(0, scaleRatio-1.0) * 0.20
 	overlapBonus := iou * 0.85
 	if settings.Profile == trackingProfileBall {
-		if track.Hits >= settings.MinHits && areaRatio > 2.2 && iou < 0.12 {
+		if track.Hits >= settings.MinHits && scaleRatio > 2.5 && iou < 0.12 {
 			return 0, false
 		}
-		sizePenalty = math.Max(0, areaRatio-1.0) * 0.30
+		sizePenalty = math.Max(0, scaleRatio-1.0) * 0.30
 		overlapBonus = iou * 1.15
 	}
 
 	return distanceScore + sizePenalty - overlapBonus, true
+}
+
+func trackDetectionMatchDistance(trackRect, detectionRect image.Rectangle, configuredDistance float64) float64 {
+	trackDiagonal := math.Hypot(float64(trackRect.Dx()), float64(trackRect.Dy()))
+	detectionDiagonal := math.Hypot(float64(detectionRect.Dx()), float64(detectionRect.Dy()))
+	objectRadius := math.Max(trackDiagonal, detectionDiagonal) / 2
+
+	// MaxMatchDistance remains the base travel allowance. Add up to one more
+	// base distance for the object's radius because a large, blurred ball can
+	// move its detected center farther between frames than a small aircraft.
+	// The cap prevents a large foreground region from matching across the
+	// entire image.
+	return configuredDistance + math.Min(configuredDistance, objectRadius)
 }
 
 func rectIOU(a, b image.Rectangle) float64 {
@@ -419,23 +433,17 @@ func minDetectionFillRatioForSettings(settings TrackingSettings) float64 {
 }
 
 func minConfirmedHitsForClassification(settings TrackingSettings) int {
-	if settings.Profile == trackingProfileBall {
-		if settings.MinHits > 2 {
-			return settings.MinHits
-		}
-		return 2
-	}
-	if settings.MinHits > 3 {
+	if settings.MinHits > 2 {
 		return settings.MinHits
 	}
-	return 3
+	// Two points are the minimum needed to measure real displacement. Honor a
+	// configured MinHits of 2 so a short, fast crossing is not silently held
+	// to the general profile's default of 3.
+	return 2
 }
 
 func minTrackTrailPointsForSettings(settings TrackingSettings) int {
-	if settings.Profile == trackingProfileBall {
-		return 2
-	}
-	return 3
+	return minConfirmedHitsForClassification(settings)
 }
 
 func minTrackNetDisplacementForSettings(settings TrackingSettings) float64 {
