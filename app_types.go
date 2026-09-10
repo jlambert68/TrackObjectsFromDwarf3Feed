@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	trackBoxScale          = 4
+	trackBoxScale          = 2
 	trackCircleRadius      = 16
 	trackCrosshairArm      = 24
 	trackingProfileGeneral = "general"
@@ -48,7 +48,7 @@ func DefaultTrackingSettingsForProfile(profile string) TrackingSettings {
 		return TrackingSettings{
 			Profile:               trackingProfileBall,
 			MinArea:               20.0,
-			MaxArea:               15000.0,
+			MaxArea:               60000.0,
 			SlowMinSpeed:          1.5,
 			MinSpeed:              4.0,
 			MaxMatchDistance:      140.0,
@@ -358,8 +358,8 @@ type DwarfQueuedRecording struct {
 	Capture         CaptureMetadata `json:"capture"`
 }
 
-// BufferedFrame is one pre-event frame kept in RAM so recording can include
-// context before the first fast object is detected.
+// BufferedFrame is one pre-event frame reference. Seekable files keep only
+// metadata here; live inputs use temporary image files until an event begins.
 type BufferedFrame struct {
 	ImagePath string
 	MaskPath  string
@@ -374,6 +374,8 @@ type EventRecorder struct {
 	TrackedWriter *gocv.VideoWriter
 	MaskedWriter  *gocv.VideoWriter
 	TrackingFile  *os.File
+	WriteOriginal bool
+	WriteMask     bool
 
 	Directory string
 	StartedAt time.Time

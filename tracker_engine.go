@@ -13,17 +13,24 @@ import (
 
 var ErrStopTracking = errors.New("stop tracking")
 
+const ballFrameDifferenceThreshold = 20
+
 // TrackerConfig defines one tracker run independently of any specific UI.
 type TrackerConfig struct {
-	Input        string
-	InputLabel   string
-	OutputDir    string
-	ShowMask     bool
-	RecordEvents bool
-	FallbackFPS  float64
-	Settings     TrackingSettings
-	Nostr        NostrSettings
-	Capture      CaptureMetadata
+	Input               string
+	InputLabel          string
+	OutputDir           string
+	ShowMask            bool
+	RecordEvents        bool
+	ExportOriginalVideo bool
+	ExportMaskVideo     bool
+	FallbackFPS         float64
+	AnalysisMaxWidth    int
+	PreviewMaxWidth     int
+	PreviewFPS          float64
+	Settings            TrackingSettings
+	Nostr               NostrSettings
+	Capture             CaptureMetadata
 }
 
 type NostrSettings struct {
@@ -44,6 +51,8 @@ type TrackerReady struct {
 	FPS            float64
 	Width          int
 	Height         int
+	AnalysisWidth  int
+	AnalysisHeight int
 	TotalFrames    int
 	Duration       time.Duration
 	HasFixedLength bool
@@ -138,26 +147,45 @@ func (e *TrackerEngine) Run() (runErr error) {
 
 	frame := gocv.NewMat()
 	defer frame.Close()
+	analysisFrame := gocv.NewMat()
+	defer analysisFrame.Close()
 	gray := gocv.NewMat()
 	defer gray.Close()
 	blurred := gocv.NewMat()
 	defer blurred.Close()
+	previousBlurred := gocv.NewMat()
+	defer previousBlurred.Close()
+	slowReference := gocv.NewMat()
+	defer slowReference.Close()
+	slowReferenceAge := 0
 	mask := gocv.NewMat()
 	defer mask.Close()
+	temporalMask := gocv.NewMat()
+	defer temporalMask.Close()
+	slowTemporalMask := gocv.NewMat()
+	defer slowTemporalMask.Close()
+	darkObjectMask := gocv.NewMat()
+	defer darkObjectMask.Close()
 	cleanMask := gocv.NewMat()
 	defer cleanMask.Close()
 	settings := e.effectiveSettings()
+	totalFrames := 0
+	if e.Config.InputLabel == "video file" {
+		totalFrames = int(math.Round(capture.Get(gocv.VideoCaptureFrameCount)))
+	}
 
-	// Disable MOG2 shadow labeling so moving objects darker than the background
-	// are still emitted as full foreground instead of being downgraded to the
-	// intermediate "shadow" class and discarded by the later binary threshold.
-	background := gocv.NewBackgroundSubtractorMOG2WithParams(settings.MOG2History, settings.MOG2VarThreshold, false)
+	// Ball tracking uses temporal differences, so General tracking can retain
+	// MOG2 shadow classification and reject those regions at the binary threshold.
+	detectShadows := settings.Profile == trackingProfileGeneral
+	background := gocv.NewBackgroundSubtractorMOG2WithParams(settings.MOG2History, settings.MOG2VarThreshold, detectShadows)
 	defer background.Close()
 
 	openKernel := gocv.GetStructuringElement(gocv.MorphEllipse, image.Pt(3, 3))
 	defer openKernel.Close()
 	dilateKernel := gocv.GetStructuringElement(gocv.MorphEllipse, image.Pt(5, 5))
 	defer dilateKernel.Close()
+	darkObjectKernel := gocv.GetStructuringElement(gocv.MorphEllipse, image.Pt(15, 15))
+	defer darkObjectKernel.Close()
 	var tracks []*Track
 	var buffer []BufferedFrame
 	var recorder *EventRecorder
@@ -214,16 +242,72 @@ func (e *TrackerEngine) Run() (runErr error) {
 			}
 		}
 
-		if err := gocv.CvtColor(frame, &gray, gocv.ColorBGRToGray); err != nil {
+		processingFrame, analysisScale, err := frameForAnalysis(frame, &analysisFrame, e.Config.AnalysisMaxWidth)
+		if err != nil {
 			continue
 		}
-		if err := gocv.GaussianBlur(gray, &blurred, image.Pt(settings.BlurSize, settings.BlurSize), 0, 0, gocv.BorderDefault); err != nil {
+		analysisSettings := trackingSettingsForScale(settings, analysisScale)
+
+		if err := gocv.CvtColor(processingFrame, &gray, gocv.ColorBGRToGray); err != nil {
 			continue
 		}
-		if err := background.Apply(blurred, &mask); err != nil {
+		if err := gocv.GaussianBlur(gray, &blurred, image.Pt(analysisSettings.BlurSize, analysisSettings.BlurSize), 0, 0, gocv.BorderDefault); err != nil {
 			continue
 		}
-		gocv.Threshold(mask, &cleanMask, float32(settings.ForegroundThreshold), 255, gocv.ThresholdBinary)
+		hasPreviousFrame := !previousBlurred.Empty()
+		if hasPreviousFrame {
+			if err := gocv.AbsDiff(blurred, previousBlurred, &temporalMask); err != nil {
+				continue
+			}
+			gocv.Threshold(temporalMask, &temporalMask, ballFrameDifferenceThreshold, 255, gocv.ThresholdBinary)
+		}
+		blurred.CopyTo(&previousBlurred)
+		if analysisScale < 1 {
+			if slowReference.Empty() {
+				blurred.CopyTo(&slowReference)
+				slowReferenceAge = 0
+			} else {
+				if err := gocv.AbsDiff(blurred, slowReference, &slowTemporalMask); err != nil {
+					continue
+				}
+				gocv.Threshold(slowTemporalMask, &slowTemporalMask, ballFrameDifferenceThreshold, 255, gocv.ThresholdBinary)
+				slowReferenceAge++
+				if slowReferenceAge >= 15 {
+					blurred.CopyTo(&slowReference)
+					slowReferenceAge = 0
+				}
+			}
+		}
+
+		useTemporalDetections := settings.Profile == trackingProfileBall
+		if settings.Profile == trackingProfileBall {
+			// A rolling or thrown ball crosses the image in only a few frames. MOG2
+			// can absorb it, label it as a shadow, or emit only disconnected pieces
+			// of its motion blur. Consecutive-frame differencing is a better fit for
+			// the stationary DWARF camera: it preserves every moving edge and does
+			// not depend on the background model's learning state.
+			if !hasPreviousFrame {
+				continue
+			}
+			temporalMask.CopyTo(&cleanMask)
+		} else {
+			if err := background.Apply(blurred, &mask); err != nil {
+				continue
+			}
+			gocv.Threshold(mask, &cleanMask, float32(settings.ForegroundThreshold), 255, gocv.ThresholdBinary)
+			if analysisScale < 1 && !slowTemporalMask.Empty() {
+				slowTemporalMask.CopyTo(&cleanMask)
+				useTemporalDetections = true
+				if err := gocv.MorphologyEx(gray, &darkObjectMask, gocv.MorphBlackhat, darkObjectKernel); err == nil {
+					gocv.Threshold(darkObjectMask, &darkObjectMask, 14, 255, gocv.ThresholdBinary)
+					motionSupport := slowTemporalMask.Clone()
+					_ = gocv.Dilate(motionSupport, &motionSupport, darkObjectKernel)
+					_ = gocv.BitwiseAnd(darkObjectMask, motionSupport, &darkObjectMask)
+					_ = gocv.BitwiseOr(cleanMask, darkObjectMask, &cleanMask)
+					motionSupport.Close()
+				}
+			}
+		}
 		if err := gocv.MorphologyEx(cleanMask, &cleanMask, gocv.MorphOpen, openKernel); err != nil {
 			continue
 		}
@@ -231,16 +315,65 @@ func (e *TrackerEngine) Run() (runErr error) {
 			continue
 		}
 
-		trackingROI := trackingROIForSize(frame.Cols(), frame.Rows(), settings)
-		applyTrackingROI(&cleanMask, trackingROI)
+		analysisROI := trackingROIForSize(processingFrame.Cols(), processingFrame.Rows(), analysisSettings)
+		applyTrackingROI(&cleanMask, analysisROI)
 
-		detections := findDetections(cleanMask, settings)
-		tracks, nextTrackID = updateTracks(tracks, detections, now, frameDT, nextTrackID, settings)
+		detectionSettings := analysisSettings
+		associationSettings := settings
+		if useTemporalDetections {
+			// Temporal detections describe a fast object's swept motion between
+			// frames. Use the tolerant association rules for that geometry even
+			// when the UI has the General profile selected; classification still
+			// uses the user's General speed and persistence thresholds below.
+			detectionSettings.Profile = trackingProfileBall
+			associationSettings.Profile = trackingProfileBall
+			ballDefaults := DefaultTrackingSettingsForProfile(trackingProfileBall)
+			ballMaxArea := ballDefaults.MaxArea * analysisScale * analysisScale
+			if detectionSettings.MaxArea < ballMaxArea {
+				detectionSettings.MaxArea = ballMaxArea
+			}
+			if associationSettings.MaxMatchDistance < ballDefaults.MaxMatchDistance {
+				associationSettings.MaxMatchDistance = ballDefaults.MaxMatchDistance
+			}
+		}
+		detections := findDetections(cleanMask, detectionSettings)
+		if settings.Profile == trackingProfileGeneral && hasPreviousFrame && analysisScale >= 1 {
+			// Recover only substantial fast transients from frame differencing.
+			// Small and slow targets remain driven by MOG2, avoiding duplicate
+			// detections and scene-wide noise when clouds or the camera shift.
+			fastMask := temporalMask.Clone()
+			if err := gocv.MorphologyEx(fastMask, &fastMask, gocv.MorphOpen, openKernel); err == nil {
+				_ = gocv.Dilate(fastMask, &fastMask, dilateKernel)
+				applyTrackingROI(&fastMask, trackingROIForSize(processingFrame.Cols(), processingFrame.Rows(), analysisSettings))
+				fastSettings := analysisSettings
+				fastSettings.Profile = trackingProfileBall
+				if fastSettings.MinArea < 80 {
+					fastSettings.MinArea = 80
+				}
+				fastDefaults := DefaultTrackingSettingsForProfile(trackingProfileBall)
+				if fastSettings.MaxArea < fastDefaults.MaxArea {
+					fastSettings.MaxArea = fastDefaults.MaxArea
+				}
+				fastDetections := findDetections(fastMask, fastSettings)
+				if len(fastDetections) > 0 {
+					detections = fastDetections
+					associationSettings.Profile = trackingProfileBall
+					if associationSettings.MaxMatchDistance < fastDefaults.MaxMatchDistance {
+						associationSettings.MaxMatchDistance = fastDefaults.MaxMatchDistance
+					}
+				}
+			}
+			fastMask.Close()
+		}
+		if analysisScale < 1 {
+			detections = scaleDetections(detections, 1/analysisScale)
+		}
+		trackingROI := trackingROIForSize(frame.Cols(), frame.Rows(), settings)
+		tracks, nextTrackID = updateTracks(tracks, detections, now, frameDT, nextTrackID, associationSettings)
 		tracks = filterTracksToROI(tracks, trackingROI)
 
 		meta := makeFrameMetadata(sourceFrame, firstFrameTime, now, tracks, settings)
-		mean := frame.Mean()
-		meta.MeanLuma = 0.114*mean.Val1 + 0.587*mean.Val2 + 0.299*mean.Val3
+		meta.MeanLuma = gray.Mean().Val1
 		interesting := hasFreshInterestingTracks(tracks, settings)
 
 		if interesting {
@@ -251,7 +384,8 @@ func (e *TrackerEngine) Run() (runErr error) {
 			// Full-segment processing mode still emits per-frame metadata through
 			// OnFrame, but it does not open per-event video writers.
 		} else if recorder == nil {
-			bufferedFrame, err := spoolBufferedFrame(frame, cleanMask, bufferDir, meta, now)
+			seekableVideo := e.Config.InputLabel == "video file"
+			bufferedFrame, err := bufferFrame(frame, cleanMask, bufferDir, meta, now, !seekableVideo, e.Config.ExportMaskVideo)
 			if err != nil {
 				return err
 			}
@@ -259,7 +393,22 @@ func (e *TrackerEngine) Run() (runErr error) {
 			buffer = trimBuffer(buffer, now.Add(-settings.PreEventDuration))
 
 			if interesting {
-				recorder, err = startEvent(e.Config.OutputDir, fps, frame.Cols(), frame.Rows(), buffer, settings, e.Config.Capture)
+				sourceVideo := ""
+				if seekableVideo {
+					sourceVideo = e.Config.Input
+				}
+				recorder, err = startEvent(
+					e.Config.OutputDir,
+					fps,
+					frame.Cols(),
+					frame.Rows(),
+					buffer,
+					settings,
+					e.Config.Capture,
+					sourceVideo,
+					e.Config.ExportOriginalVideo,
+					e.Config.ExportMaskVideo,
+				)
 				if err != nil {
 					return err
 				}
@@ -296,11 +445,22 @@ func (e *TrackerEngine) Run() (runErr error) {
 			}
 		}
 
-		totalFrames := 0
-		if e.Config.InputLabel == "video file" {
-			totalFrames = int(math.Round(capture.Get(gocv.VideoCaptureFrameCount)))
-		}
-		update := buildFrameUpdate(frame, cleanMask, tracks, meta, len(detections), recorder != nil, sourceFrame < int(fps*3), e.Config.ShowMask, settings, fps, totalFrames)
+		renderPreview := e.Hooks.OnFrame != nil && previewFrameDue(sourceFrame, fps, e.Config.PreviewFPS)
+		update := buildFrameUpdate(
+			frame,
+			cleanMask,
+			tracks,
+			meta,
+			len(detections),
+			recorder != nil,
+			sourceFrame < int(fps*3),
+			renderPreview,
+			e.Config.ShowMask,
+			e.Config.PreviewMaxWidth,
+			settings,
+			fps,
+			totalFrames,
+		)
 		err = e.emitFrame(update, now)
 		update.Close()
 		if err != nil {
@@ -410,6 +570,9 @@ func (e *TrackerEngine) emitReady(capture *gocv.VideoCapture, fps float64) error
 	}
 	totalFrames := int(math.Round(capture.Get(gocv.VideoCaptureFrameCount)))
 	hasFixedLength := e.Config.InputLabel == "video file" && totalFrames > 0
+	width := int(capture.Get(gocv.VideoCaptureFrameWidth))
+	height := int(capture.Get(gocv.VideoCaptureFrameHeight))
+	analysisWidth, analysisHeight, _ := scaledFrameSize(width, height, e.Config.AnalysisMaxWidth)
 	duration := time.Duration(0)
 	if hasFixedLength && fps > 0 {
 		duration = time.Duration(float64(time.Second) * (float64(totalFrames) / fps))
@@ -418,8 +581,10 @@ func (e *TrackerEngine) emitReady(capture *gocv.VideoCapture, fps float64) error
 		Input:          e.Config.Input,
 		InputLabel:     e.Config.InputLabel,
 		FPS:            fps,
-		Width:          int(capture.Get(gocv.VideoCaptureFrameWidth)),
-		Height:         int(capture.Get(gocv.VideoCaptureFrameHeight)),
+		Width:          width,
+		Height:         height,
+		AnalysisWidth:  analysisWidth,
+		AnalysisHeight: analysisHeight,
 		TotalFrames:    totalFrames,
 		Duration:       duration,
 		HasFixedLength: hasFixedLength,
@@ -456,32 +621,16 @@ func buildFrameUpdate(
 	detectionCount int,
 	recording bool,
 	learningBackground bool,
+	renderPreview bool,
 	includeMask bool,
+	previewMaxWidth int,
 	settings TrackingSettings,
 	fps float64,
 	totalFrames int,
 ) FrameUpdate {
-	display := frame.Clone()
-	drawLiveOverlay(&display, tracks, settings)
-
 	fastCount, slowCount := countTrackTypes(meta.Tracks)
 	status := fmt.Sprintf("FAST: %d   SLOW: %d   detections: %d   tracks: %d",
 		fastCount, slowCount, detectionCount, len(tracks))
-	gocv.PutText(&display, status, image.Pt(20, 30),
-		gocv.FontHersheySimplex, 0.9, textColor, 2)
-
-	if recording {
-		gocv.PutText(&display, "RECORDING EVENT", image.Pt(20, 60),
-			gocv.FontHersheySimplex, 0.9, warnColor, 2)
-	} else {
-		gocv.PutText(&display, fmt.Sprintf("RAM PREBUFFER: %.0fs", settings.PreEventDuration.Seconds()),
-			image.Pt(20, 60), gocv.FontHersheySimplex, 0.75, textColor, 2)
-	}
-
-	if learningBackground {
-		gocv.PutText(&display, "LEARNING BACKGROUND...", image.Pt(20, 90),
-			gocv.FontHersheySimplex, 0.9, warnColor, 2)
-	}
 
 	elapsed := time.Duration(0)
 	if fps > 0 && meta.SourceFrame > 0 {
@@ -499,8 +648,6 @@ func buildFrameUpdate(
 			formatVideoProgressDuration(elapsed),
 			formatVideoProgressDuration(totalDuration),
 			progress*100)
-		gocv.PutText(&display, progressText, image.Pt(20, 120),
-			gocv.FontHersheySimplex, 0.85, textColor, 2)
 	}
 
 	update := FrameUpdate{
@@ -518,13 +665,51 @@ func buildFrameUpdate(
 		TotalDuration:      totalDuration,
 		Progress:           progress,
 		HasFixedLength:     hasFixedLength,
-		Display:            display,
-		hasDisplay:         true,
 	}
 
-	if includeMask {
-		update.Mask = cleanMask.Clone()
-		update.hasMask = true
+	if renderPreview {
+		previewWidth, previewHeight, previewScale := scaledFrameSize(frame.Cols(), frame.Rows(), previewMaxWidth)
+		if previewScale < 1 {
+			update.Display = gocv.NewMat()
+			if err := gocv.Resize(frame, &update.Display, image.Pt(previewWidth, previewHeight), 0, 0, gocv.InterpolationArea); err == nil {
+				update.hasDisplay = true
+			} else {
+				update.Display.Close()
+			}
+		} else {
+			update.Display = frame.Clone()
+			update.hasDisplay = true
+		}
+
+		if update.hasDisplay {
+			drawMetadataOverlay(&update.Display, scaleTrackMetadata(meta.Tracks, previewScale), settings)
+			gocv.PutText(&update.Display, status, image.Pt(20, 30),
+				gocv.FontHersheySimplex, 0.9, textColor, 2)
+			if recording {
+				gocv.PutText(&update.Display, "RECORDING EVENT", image.Pt(20, 60),
+					gocv.FontHersheySimplex, 0.9, warnColor, 2)
+			} else {
+				gocv.PutText(&update.Display, fmt.Sprintf("PREBUFFER: %.0fs", settings.PreEventDuration.Seconds()),
+					image.Pt(20, 60), gocv.FontHersheySimplex, 0.75, textColor, 2)
+			}
+			if learningBackground {
+				gocv.PutText(&update.Display, "LEARNING BACKGROUND...", image.Pt(20, 90),
+					gocv.FontHersheySimplex, 0.9, warnColor, 2)
+			}
+			if progressText != "" {
+				gocv.PutText(&update.Display, progressText, image.Pt(20, 120),
+					gocv.FontHersheySimplex, 0.85, textColor, 2)
+			}
+		}
+
+		if includeMask {
+			update.Mask = gocv.NewMat()
+			if err := gocv.Resize(cleanMask, &update.Mask, image.Pt(previewWidth, previewHeight), 0, 0, gocv.InterpolationNearestNeighbor); err == nil {
+				update.hasMask = true
+			} else {
+				update.Mask.Close()
+			}
+		}
 	}
 
 	return update

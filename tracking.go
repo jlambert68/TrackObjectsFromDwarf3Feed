@@ -8,11 +8,20 @@ import (
 	"gocv.io/x/gocv"
 )
 
+const maxMetadataTrailPoints = 120
+
 func maxMissedFramesForSettings(settings TrackingSettings) int {
 	if settings.Profile == trackingProfileBall {
 		return 12
 	}
-	return 1
+	return 8
+}
+
+func maxMissedFramesForTrack(track *Track, settings TrackingSettings) int {
+	if settings.Profile == trackingProfileBall || (track != nil && track.Speed >= settings.MinSpeed) {
+		return 12
+	}
+	return maxMissedFramesForSettings(settings)
 }
 
 // findDetections converts the cleaned foreground mask into bounding boxes and
@@ -253,7 +262,7 @@ func updateTracks(
 
 	activeTracks := tracks[:0]
 	for _, track := range tracks {
-		if track.Missed > maxMissedFramesForSettings(settings) {
+		if track.Missed > maxMissedFramesForTrack(track, settings) {
 			continue
 		}
 		activeTracks = append(activeTracks, track)
@@ -301,21 +310,22 @@ func scoreTrackDetectionMatch(track *Track, detection Detection, predictedX, pre
 	}
 
 	iou := rectIOU(track.Rect, detection.Rect)
+	fastTransient := settings.Profile == trackingProfileBall || track.Speed >= settings.MinSpeed
 
 	// Once a track is established, reject candidates whose size changes too
 	// violently unless the boxes still overlap enough to justify the jump.
-	if track.Hits >= settings.MinHits*2 && scaleRatio > 3.0 && iou < 0.08 {
+	if !fastTransient && track.Hits >= settings.MinHits*2 && scaleRatio > 3.0 && iou < 0.08 {
 		return 0, false
 	}
 
 	distanceScore := distance / matchDistance
 	sizePenalty := math.Max(0, scaleRatio-1.0) * 0.20
 	overlapBonus := iou * 0.85
-	if settings.Profile == trackingProfileBall {
-		if track.Hits >= settings.MinHits && scaleRatio > 2.5 && iou < 0.12 {
+	if fastTransient {
+		if track.Hits >= settings.MinHits && scaleRatio > 8.0 && iou < 0.04 {
 			return 0, false
 		}
-		sizePenalty = math.Max(0, scaleRatio-1.0) * 0.30
+		sizePenalty = math.Max(0, scaleRatio-1.0) * 0.12
 		overlapBonus = iou * 1.15
 	}
 
@@ -394,6 +404,9 @@ func makeFrameMetadata(sourceFrame int, start, now time.Time, tracks []*Track, s
 func makeTrailMetadata(points []image.Point) []TrailPoint {
 	if len(points) == 0 {
 		return nil
+	}
+	if len(points) > maxMetadataTrailPoints {
+		points = points[len(points)-maxMetadataTrailPoints:]
 	}
 
 	trail := make([]TrailPoint, len(points))

@@ -27,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"dwarf3-event-tracker/internal/applog"
@@ -124,6 +125,8 @@ type trackerApp struct {
 	dwarfDeleteCheck         *widget.Check
 	dwarfDebugWSCheck        *widget.Check
 	showMask                 *widget.Check
+	exportOriginalCheck      *widget.Check
+	exportMaskVideoCheck     *widget.Check
 	dateFilter               *widget.Entry
 	objectFilter             *widget.Entry
 	speedFilter              *widget.Entry
@@ -196,6 +199,8 @@ type trackerApp struct {
 
 	statusLabel                *widget.Label
 	eventLabel                 *widget.Label
+	consoleLogLabel            *widget.Label
+	consoleLogScroll           *container.Scroll
 	mediaServerLabel           *widget.Label
 	externalIPLabel            *widget.Label
 	intranetIPLabel            *widget.Label
@@ -243,6 +248,9 @@ type trackerApp struct {
 	activePlaybackOverlay   *playbackOverlay
 	pendingRunStatus        string
 	pendingRunError         error
+	previewUpdatePending    atomic.Bool
+	consoleLogLines         []string
+	stopConsoleLog          func()
 	projectRoot             string
 	mediaFilesMu            sync.RWMutex
 	mediaFiles              map[string]string
@@ -633,6 +641,8 @@ const (
 	prefTrackingObjectGIFs  = "tracking.generate_object_gifs"
 	prefTrackingPresets     = "tracking.presets"
 	prefTrackingPresetName  = "tracking.preset_name"
+	prefExportOriginalVideo = "event.export_original_video"
+	prefExportMaskVideo     = "event.export_mask_video"
 	prefNostrEnabled        = "nostr.enabled"
 	prefNostrRelayURL       = "nostr.relay_url"
 	prefNostrSecretKey      = "nostr.secret_key"
@@ -693,6 +703,7 @@ func main() {
 		ui.stopTracking()
 		ui.stopDwarfCapture()
 		ui.stopMediaServer()
+		ui.stopConsoleLogging()
 		window.Close()
 	})
 
@@ -746,6 +757,8 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 
 	showMask := widget.NewCheck("Show mask tab", nil)
 	showMask.SetChecked(true)
+	exportOriginalCheck := widget.NewCheck("Export original.avi", nil)
+	exportMaskVideoCheck := widget.NewCheck("Export masked.avi", nil)
 
 	dateFilter := widget.NewEntry()
 	dateFilter.SetPlaceHolder("Date contains YYYY-MM-DD")
@@ -872,6 +885,11 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 	nostrTestMessageEntry.SetPlaceHolder("Write a Nostr test note")
 	nostrTestMessageEntry.Wrapping = fyne.TextWrapWord
 
+	consoleLogLabel := widget.NewLabel("")
+	consoleLogLabel.Wrapping = fyne.TextWrapOff
+	consoleLogScroll := container.NewScroll(consoleLogLabel)
+	consoleLogScroll.SetMinSize(fyne.NewSize(420, 96))
+
 	ui := &trackerApp{
 		window:                     window,
 		sourceRadio:                sourceRadio,
@@ -893,6 +911,8 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 		dwarfDeleteCheck:           dwarfDeleteCheck,
 		dwarfDebugWSCheck:          dwarfDebugWSCheck,
 		showMask:                   showMask,
+		exportOriginalCheck:        exportOriginalCheck,
+		exportMaskVideoCheck:       exportMaskVideoCheck,
 		dateFilter:                 dateFilter,
 		objectFilter:               objectFilter,
 		speedFilter:                speedFilter,
@@ -931,6 +951,8 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 		playbackSlider:             playbackSlider,
 		statusLabel:                widget.NewLabel("Idle"),
 		eventLabel:                 widget.NewLabel("No event yet"),
+		consoleLogLabel:            consoleLogLabel,
+		consoleLogScroll:           consoleLogScroll,
 		dwarfStatusLabel:           widget.NewLabel("DWARF idle"),
 		dwarfQueueLabel:            widget.NewLabel("DWARF queue: 0"),
 		mediaServerLabel:           widget.NewLabel("Media HTTP: starting..."),
@@ -955,6 +977,7 @@ func newTrackerApp(window fyne.Window) *trackerApp {
 		dwarfRawWSPayload:          "{\n  \"interface\": 10007,\n  \"camId\": 0,\n  \"name\": \"DWARF_TEST_MANUAL\"\n}",
 		dwarfSessionProbePayload:   "{\n  \"clientId\": \"DAF3\",\n  \"type\": \"ping\"\n}",
 	}
+	ui.stopConsoleLog = applog.Subscribe(ui.appendConsoleLog)
 
 	ui.fileButton = widget.NewButtonWithIcon("", theme.FolderOpenIcon(), ui.pickVideoFile)
 	ui.outputButton = widget.NewButtonWithIcon("", theme.FolderOpenIcon(), ui.pickOutputFolder)
@@ -1128,7 +1151,12 @@ func (ui *trackerApp) buildUI() fyne.CanvasObject {
 		widget.NewFormItem("Output Dir", container.NewBorder(nil, nil, nil, ui.outputButton, ui.outputEntry)),
 		widget.NewFormItem("Fallback FPS", ui.fpsEntry),
 	)
-	sourceSection := uiSection("Input", container.NewVBox(sourceForm, ui.showMask))
+	sourceSection := uiSection("Input", container.NewVBox(
+		sourceForm,
+		ui.showMask,
+		widget.NewLabel("Event export (tracked.avi is always written)"),
+		container.NewGridWithColumns(2, ui.exportOriginalCheck, ui.exportMaskVideoCheck),
+	))
 
 	dwarfForm := widget.NewForm(
 		widget.NewFormItem("Host", ui.dwarfHostEntry),
@@ -1236,6 +1264,15 @@ func (ui *trackerApp) buildUI() fyne.CanvasObject {
 		ui.statusLabel,
 		ui.eventLabel,
 	)
+	consoleLogPanel := container.NewPadded(container.NewBorder(
+		container.NewVBox(widget.NewSeparator(), sectionTitle("Console log")),
+		nil,
+		nil,
+		nil,
+		ui.consoleLogScroll,
+	))
+	statusArea := container.NewHSplit(statusBar, consoleLogPanel)
+	statusArea.Offset = 0.5
 
 	playbackControls := container.NewBorder(
 		nil,
@@ -1310,7 +1347,7 @@ func (ui *trackerApp) buildUI() fyne.CanvasObject {
 	historyPanel.Offset = 0.34
 	workbench := container.NewHSplit(controls, ui.tabs)
 	workbench.Offset = 0.30
-	mainPanel := container.NewBorder(nil, statusBar, nil, nil, workbench)
+	mainPanel := container.NewBorder(nil, statusArea, nil, nil, workbench)
 	content := container.NewHSplit(mainPanel, container.NewPadded(historyPanel))
 	content.Offset = 0.72
 
@@ -1342,6 +1379,32 @@ func uiStatusBar(labels ...*widget.Label) fyne.CanvasObject {
 		items = append(items, label)
 	}
 	return container.NewPadded(container.NewVBox(items...))
+}
+
+const maxConsoleLogLines = 500
+
+func (ui *trackerApp) appendConsoleLog(entry string) {
+	entry = strings.TrimSpace(strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(entry))
+	if entry == "" || ui.consoleLogLabel == nil || ui.consoleLogScroll == nil {
+		return
+	}
+
+	fyne.Do(func() {
+		ui.consoleLogLines = append(ui.consoleLogLines, entry)
+		if excess := len(ui.consoleLogLines) - maxConsoleLogLines; excess > 0 {
+			copy(ui.consoleLogLines, ui.consoleLogLines[excess:])
+			ui.consoleLogLines = ui.consoleLogLines[:maxConsoleLogLines]
+		}
+		ui.consoleLogLabel.SetText(strings.Join(ui.consoleLogLines, "\n"))
+		ui.consoleLogScroll.ScrollToBottom()
+	})
+}
+
+func (ui *trackerApp) stopConsoleLogging() {
+	if ui.stopConsoleLog != nil {
+		ui.stopConsoleLog()
+		ui.stopConsoleLog = nil
+	}
 }
 
 func (ui *trackerApp) refreshSourceControls() {
@@ -3078,14 +3141,19 @@ func (ui *trackerApp) buildConfig() (TrackerConfig, error) {
 			return TrackerConfig{}, errors.New("video file path is required")
 		}
 		return TrackerConfig{
-			Input:        ui.fileEntry.Text,
-			InputLabel:   "video file",
-			OutputDir:    outputDir,
-			ShowMask:     ui.showMask.Checked,
-			RecordEvents: true,
-			FallbackFPS:  fallbackFPS,
-			Settings:     settings,
-			Nostr:        nostrSettings,
+			Input:               ui.fileEntry.Text,
+			InputLabel:          "video file",
+			OutputDir:           outputDir,
+			ShowMask:            ui.showMask.Checked,
+			RecordEvents:        true,
+			ExportOriginalVideo: ui.exportOriginalCheck.Checked,
+			ExportMaskVideo:     ui.exportMaskVideoCheck.Checked,
+			FallbackFPS:         fallbackFPS,
+			AnalysisMaxWidth:    defaultAnalysisMaxWidth,
+			PreviewMaxWidth:     defaultPreviewMaxWidth,
+			PreviewFPS:          defaultPreviewFPS,
+			Settings:            settings,
+			Nostr:               nostrSettings,
 		}, nil
 	}
 
@@ -3098,15 +3166,20 @@ func (ui *trackerApp) buildConfig() (TrackerConfig, error) {
 	}
 
 	return TrackerConfig{
-		Input:        ui.urlEntry.Text,
-		InputLabel:   "DWARF 3 live stream",
-		OutputDir:    outputDir,
-		ShowMask:     ui.showMask.Checked,
-		RecordEvents: true,
-		FallbackFPS:  fallbackFPS,
-		Settings:     settings,
-		Nostr:        nostrSettings,
-		Capture:      capture,
+		Input:               ui.urlEntry.Text,
+		InputLabel:          "DWARF 3 live stream",
+		OutputDir:           outputDir,
+		ShowMask:            ui.showMask.Checked,
+		RecordEvents:        true,
+		ExportOriginalVideo: ui.exportOriginalCheck.Checked,
+		ExportMaskVideo:     ui.exportMaskVideoCheck.Checked,
+		FallbackFPS:         fallbackFPS,
+		AnalysisMaxWidth:    defaultAnalysisMaxWidth,
+		PreviewMaxWidth:     defaultPreviewMaxWidth,
+		PreviewFPS:          defaultPreviewFPS,
+		Settings:            settings,
+		Nostr:               nostrSettings,
+		Capture:             capture,
 	}, nil
 }
 
@@ -3126,15 +3199,20 @@ func (ui *trackerApp) buildQueuedDwarfTrackerConfig(recording DwarfQueuedRecordi
 	}
 
 	return TrackerConfig{
-		Input:        recording.LocalPath,
-		InputLabel:   "video file",
-		OutputDir:    outputDir,
-		ShowMask:     ui.showMask.Checked,
-		RecordEvents: true,
-		FallbackFPS:  ui.parseFallbackFPS(),
-		Settings:     settings,
-		Nostr:        nostrSettings,
-		Capture:      recording.Capture,
+		Input:               recording.LocalPath,
+		InputLabel:          "video file",
+		OutputDir:           outputDir,
+		ShowMask:            ui.showMask.Checked,
+		RecordEvents:        true,
+		ExportOriginalVideo: ui.exportOriginalCheck.Checked,
+		ExportMaskVideo:     ui.exportMaskVideoCheck.Checked,
+		FallbackFPS:         ui.parseFallbackFPS(),
+		AnalysisMaxWidth:    defaultAnalysisMaxWidth,
+		PreviewMaxWidth:     defaultPreviewMaxWidth,
+		PreviewFPS:          defaultPreviewFPS,
+		Settings:            settings,
+		Nostr:               nostrSettings,
+		Capture:             recording.Capture,
 	}, nil
 }
 
@@ -3162,6 +3240,9 @@ func (ui *trackerApp) executeTracker(config TrackerConfig, stopCh <-chan struct{
 			OnReady: func(ready TrackerReady) error {
 				fyne.Do(func() {
 					statusText := fmt.Sprintf("Running %s at %.3f FPS (%dx%d)", ready.InputLabel, ready.FPS, ready.Width, ready.Height)
+					if ready.AnalysisWidth > 0 && (ready.AnalysisWidth != ready.Width || ready.AnalysisHeight != ready.Height) {
+						statusText += fmt.Sprintf("   analysis %dx%d", ready.AnalysisWidth, ready.AnalysisHeight)
+					}
 					if ready.HasFixedLength {
 						statusText = fmt.Sprintf("%s   video length %s   %d frames",
 							statusText,
@@ -3187,8 +3268,12 @@ func (ui *trackerApp) executeTracker(config TrackerConfig, stopCh <-chan struct{
 				return nil
 			},
 			OnFrame: func(update *FrameUpdate) error {
+				if !update.hasDisplay || !ui.previewUpdatePending.CompareAndSwap(false, true) {
+					return nil
+				}
 				displayImage, err := update.Display.ToImage()
 				if err != nil {
+					ui.previewUpdatePending.Store(false)
 					return err
 				}
 
@@ -3196,6 +3281,7 @@ func (ui *trackerApp) executeTracker(config TrackerConfig, stopCh <-chan struct{
 				if update.hasMask {
 					maskImage, err = update.Mask.ToImage()
 					if err != nil {
+						ui.previewUpdatePending.Store(false)
 						return err
 					}
 				}
@@ -3212,6 +3298,7 @@ func (ui *trackerApp) executeTracker(config TrackerConfig, stopCh <-chan struct{
 				}
 
 				fyne.Do(func() {
+					defer ui.previewUpdatePending.Store(false)
 					ui.videoImage.Image = displayImage
 					ui.videoImage.Refresh()
 					if maskImage != nil {
@@ -3603,8 +3690,8 @@ func (ui *trackerApp) updateHistorySelection() {
 		ui.historyInfo.SetText(entry.title())
 		ui.historyDetail.SetText(fmt.Sprintf("Could not load detail preview:\n%v", err))
 		ui.resetObjectSelection("Could not load tracked objects for this event.")
-		ui.openTrackedButton.Enable()
-		ui.openOriginalButton.Enable()
+		setButtonEnabled(ui.openTrackedButton, existingEventVideoPath(entry.Directory, entry.Summary.TrackedVideo) != "")
+		setButtonEnabled(ui.openOriginalButton, existingEventVideoPath(entry.Directory, entry.Summary.OriginalVideo) != "")
 		ui.restoreSettingsButton.Enable()
 		return
 	}
@@ -3613,9 +3700,17 @@ func (ui *trackerApp) updateHistorySelection() {
 	ui.historyInfo.SetText(fmt.Sprintf("%s   %.1fs   %d objects", entry.title(), entry.Summary.DurationSeconds, entry.Summary.UniqueObjects))
 	ui.historyDetail.SetText(formatEventDetail(detail, entry.Directory))
 	ui.populateObjectSelection(detail)
-	ui.openTrackedButton.Enable()
-	ui.openOriginalButton.Enable()
+	setButtonEnabled(ui.openTrackedButton, existingEventVideoPath(entry.Directory, detail.Summary.TrackedVideo) != "")
+	setButtonEnabled(ui.openOriginalButton, existingEventVideoPath(entry.Directory, detail.Summary.OriginalVideo) != "")
 	ui.restoreSettingsButton.Enable()
+}
+
+func setButtonEnabled(button *widget.Button, enabled bool) {
+	if enabled {
+		button.Enable()
+	} else {
+		button.Disable()
+	}
 }
 
 func (ui *trackerApp) openSelectedEventVideo(tracked bool) {
@@ -3639,34 +3734,31 @@ func (ui *trackerApp) openSelectedEventVideo(tracked bool) {
 		ui.showError(err)
 		return
 	}
-	filename := "original.avi"
+	filename := detail.Summary.OriginalVideo
 	label := "original"
 	var overlay *playbackOverlay
 	if tracked {
-		filename = "tracked.avi"
+		filename = detail.Summary.TrackedVideo
 		label = "tracked"
-		if _, err := os.Stat(filepath.Join(entry.Directory, filename)); err != nil && detail.HasTracking && detail.Tracking != nil {
+		if existingEventVideoPath(entry.Directory, filename) == "" && detail.HasTracking && detail.Tracking != nil {
 			overlay = &playbackOverlay{
 				Tracking:        *detail.Tracking,
 				Settings:        NormalizeTrackingSettings(detail.Summary.TrackingSettings),
 				Label:           label,
 				ShowFrameTracks: true,
 			}
-			filename = "original.avi"
+			filename = detail.Summary.OriginalVideo
 			label = "tracked (reconstructed)"
 		}
 	}
 
-	path := filepath.Join(entry.Directory, filename)
-	if _, err := os.Stat(path); err != nil {
-		ui.showError(fmt.Errorf("open %s: %w", filename, err))
+	path := existingEventVideoPath(entry.Directory, filename)
+	if path == "" {
+		ui.showError(fmt.Errorf("%s event video was not exported", label))
 		return
 	}
 
-	maskPath := filepath.Join(entry.Directory, entry.Summary.MaskedVideo)
-	if entry.Summary.MaskedVideo == "" {
-		maskPath = filepath.Join(entry.Directory, "masked.avi")
-	}
+	maskPath := existingEventVideoPath(entry.Directory, detail.Summary.MaskedVideo)
 
 	ui.sourceRadio.SetSelected("Video File")
 	ui.fileEntry.SetText(path)
@@ -3861,6 +3953,8 @@ func (ui *trackerApp) loadTrackingPreferences() {
 	ui.mog2VarThresholdEntry.SetText(prefs.StringWithFallback(prefTrackingMOG2Var, formatFloat(defaults.MOG2VarThreshold)))
 	ui.roiHeightEntry.SetText(prefs.StringWithFallback(prefTrackingROIHeight, formatFloat(defaults.TrackingROIHeightFrac)))
 	ui.generateObjectGIFsCheck.SetChecked(prefs.BoolWithFallback(prefTrackingObjectGIFs, defaults.GenerateObjectGIFs))
+	ui.exportOriginalCheck.SetChecked(prefs.BoolWithFallback(prefExportOriginalVideo, false))
+	ui.exportMaskVideoCheck.SetChecked(prefs.BoolWithFallback(prefExportMaskVideo, false))
 	ui.nostrEnableCheck.SetChecked(prefs.BoolWithFallback(prefNostrEnabled, false))
 	ui.nostrRelayEntry.SetText(prefs.StringWithFallback(prefNostrRelayURL, nostrutil.DefaultRelayURL))
 	ui.nostrSecretEntry.SetText(prefs.StringWithFallback(prefNostrSecretKey, ""))
@@ -3893,6 +3987,8 @@ func (ui *trackerApp) saveTrackingPreferences() {
 	prefs.SetString(prefTrackingMOG2Var, ui.mog2VarThresholdEntry.Text)
 	prefs.SetString(prefTrackingROIHeight, ui.roiHeightEntry.Text)
 	prefs.SetBool(prefTrackingObjectGIFs, ui.generateObjectGIFsCheck.Checked)
+	prefs.SetBool(prefExportOriginalVideo, ui.exportOriginalCheck.Checked)
+	prefs.SetBool(prefExportMaskVideo, ui.exportMaskVideoCheck.Checked)
 	prefs.SetBool(prefNostrEnabled, ui.nostrEnableCheck.Checked)
 	prefs.SetString(prefNostrRelayURL, ui.nostrRelayEntry.Text)
 	prefs.SetString(prefNostrSecretKey, ui.nostrSecretEntry.Text)
@@ -4321,20 +4417,8 @@ func (ui *trackerApp) updateSelectedObject() {
 	ui.objectName.Enable()
 	ui.objectName.SetText(object.Name)
 	ui.objectDetail.SetText(formatObjectDetail(object))
-	previewPath := representativeObjectCropPath(object)
-	if previewPath != "" {
-		crop := gocv.IMRead(previewPath, gocv.IMReadColor)
-		if !crop.Empty() {
-			if img, err := crop.ToImage(); err == nil {
-				ui.objectImage.Image = img
-				ui.objectImage.Refresh()
-			}
-		}
-		crop.Close()
-	} else {
-		ui.objectImage.Image = newPlaceholderFrame()
-		ui.objectImage.Refresh()
-	}
+	ui.objectImage.Image = loadObjectListPreview(object)
+	ui.objectImage.Refresh()
 	ui.watchObjectButton.Enable()
 	if ui.currentDetail != nil && ui.currentDetail.HasTracking && len(ui.currentDetail.Objects) > 0 {
 		ui.showFinalPositionsButton.Enable()
@@ -4533,18 +4617,12 @@ func (ui *trackerApp) watchSelectedObject() {
 	}
 
 	entry := ui.historyEntries[ui.selectedHistory]
-	videoPath := filepath.Join(entry.Directory, ui.currentDetail.Summary.OriginalVideo)
-	if ui.currentDetail.Summary.OriginalVideo == "" {
-		videoPath = filepath.Join(entry.Directory, "original.avi")
-	}
-	if _, err := os.Stat(videoPath); err != nil {
-		ui.showError(fmt.Errorf("open original video: %w", err))
+	videoPath := eventReplayBasePath(entry)
+	if videoPath == "" {
+		ui.showError(errors.New("event does not contain a replay video"))
 		return
 	}
-	maskPath := filepath.Join(entry.Directory, ui.currentDetail.Summary.MaskedVideo)
-	if ui.currentDetail.Summary.MaskedVideo == "" {
-		maskPath = filepath.Join(entry.Directory, "masked.avi")
-	}
+	maskPath := existingEventVideoPath(entry.Directory, ui.currentDetail.Summary.MaskedVideo)
 
 	cropBySourceFrame, cropSourceFrames := makeCropBySourceFrame(object.CropPaths)
 	selectedObject := object
@@ -4553,7 +4631,7 @@ func (ui *trackerApp) watchSelectedObject() {
 		Settings:           NormalizeTrackingSettings(ui.currentDetail.Summary.TrackingSettings),
 		SelectedTrackID:    object.ID,
 		SelectedObject:     &selectedObject,
-		StartFrame:         max(0, object.FirstSeenFrame-1),
+		StartFrame:         eventFrameIndexForSourceFrame(ui.currentDetail.Tracking.Frames, object.FirstSeenFrame),
 		Label:              formatObjectOption(object),
 		CropBySourceFrame:  cropBySourceFrame,
 		CropSourceFrames:   cropSourceFrames,
@@ -4604,19 +4682,13 @@ func (ui *trackerApp) watchFinalPositions() {
 	ui.applyFinalPositionThreshold(minDistance, true)
 
 	entry := ui.historyEntries[ui.selectedHistory]
-	videoPath := filepath.Join(entry.Directory, ui.currentDetail.Summary.OriginalVideo)
-	if ui.currentDetail.Summary.OriginalVideo == "" {
-		videoPath = filepath.Join(entry.Directory, "original.avi")
-	}
-	if _, err := os.Stat(videoPath); err != nil {
-		ui.showError(fmt.Errorf("open original video: %w", err))
+	videoPath := eventReplayBasePath(entry)
+	if videoPath == "" {
+		ui.showError(errors.New("event does not contain a replay video"))
 		return
 	}
 
-	maskPath := filepath.Join(entry.Directory, ui.currentDetail.Summary.MaskedVideo)
-	if ui.currentDetail.Summary.MaskedVideo == "" {
-		maskPath = filepath.Join(entry.Directory, "masked.avi")
-	}
+	maskPath := existingEventVideoPath(entry.Directory, ui.currentDetail.Summary.MaskedVideo)
 
 	overlay := &playbackOverlay{
 		Tracking:                 *ui.currentDetail.Tracking,
@@ -4714,16 +4786,7 @@ func loadEventHistory(root string) ([]eventHistoryEntry, error) {
 			_ = json.Unmarshal(data, &summary)
 		}
 		summary.TrackingSettings = NormalizeTrackingSettings(summary.TrackingSettings)
-
-		if summary.OriginalVideo == "" {
-			summary.OriginalVideo = "original.avi"
-		}
-		if summary.TrackedVideo == "" {
-			summary.TrackedVideo = "tracked.avi"
-		}
-		if summary.MaskedVideo == "" {
-			summary.MaskedVideo = "masked.avi"
-		}
+		resolveEventVideoNames(dir, &summary)
 		if summary.TrackCropsDir == "" {
 			summary.TrackCropsDir = "track_crops"
 		}
@@ -4760,15 +4823,7 @@ func loadEventSummaryFromDir(dir string) EventSummary {
 		_ = json.Unmarshal(data, &summary)
 	}
 	summary.TrackingSettings = NormalizeTrackingSettings(summary.TrackingSettings)
-	if summary.OriginalVideo == "" {
-		summary.OriginalVideo = "original.avi"
-	}
-	if summary.TrackedVideo == "" {
-		summary.TrackedVideo = "tracked.avi"
-	}
-	if summary.MaskedVideo == "" {
-		summary.MaskedVideo = "masked.avi"
-	}
+	resolveEventVideoNames(dir, &summary)
 	if summary.TrackCropsDir == "" {
 		summary.TrackCropsDir = "track_crops"
 	}
@@ -4782,6 +4837,42 @@ func loadEventSummaryFromDir(dir string) EventSummary {
 		summary.EventID = filepath.Base(dir)
 	}
 	return summary
+}
+
+func resolveEventVideoNames(dir string, summary *EventSummary) {
+	if summary == nil {
+		return
+	}
+	for filename, target := range map[string]*string{
+		"original.avi": &summary.OriginalVideo,
+		"tracked.avi":  &summary.TrackedVideo,
+		"masked.avi":   &summary.MaskedVideo,
+	} {
+		if *target != "" {
+			continue
+		}
+		if info, err := os.Stat(filepath.Join(dir, filename)); err == nil && info.Mode().IsRegular() {
+			*target = filename
+		}
+	}
+}
+
+func existingEventVideoPath(dir, filename string) string {
+	if filename == "" {
+		return ""
+	}
+	path := filepath.Join(dir, filename)
+	if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
+		return path
+	}
+	return ""
+}
+
+func eventReplayBasePath(entry eventHistoryEntry) string {
+	if path := existingEventVideoPath(entry.Directory, entry.Summary.OriginalVideo); path != "" {
+		return path
+	}
+	return existingEventVideoPath(entry.Directory, entry.Summary.TrackedVideo)
 }
 
 func (ui *trackerApp) publishVideoAnalysisNostrNote(dir string, config TrackerConfig) error {
@@ -5260,6 +5351,18 @@ func selectedTrackInFrame(frame FrameMetadata, selectedTrackID int) (TrackMetada
 	return TrackMetadata{}, false
 }
 
+func eventFrameIndexForSourceFrame(frames []FrameMetadata, sourceFrame int) int {
+	if sourceFrame <= 0 {
+		return 0
+	}
+	for index, frame := range frames {
+		if frame.SourceFrame >= sourceFrame {
+			return index
+		}
+	}
+	return max(0, len(frames)-1)
+}
+
 func addObjectCropToMap(canvas *image.RGBA, crop image.Image, mask image.Image, track TrackMetadata) {
 	if canvas == nil || crop == nil || mask == nil {
 		return
@@ -5371,11 +5474,15 @@ func loadObjectListPreview(object trackedObjectDetail) image.Image {
 		return newPlaceholderFrame()
 	}
 	img, err := crop.ToImage()
-	crop.Close()
 	if err != nil {
+		crop.Close()
 		return newPlaceholderFrame()
 	}
-	return img
+	// Mat.ToImage may expose storage owned by the Mat. Detach the pixels before
+	// closing it so Fyne can render the preview after this function returns.
+	preview := cloneImage(img)
+	crop.Close()
+	return preview
 }
 
 func formatEventDetail(detail eventHistoryDetail, dir string) string {
@@ -5391,9 +5498,9 @@ func formatEventDetail(detail eventHistoryDetail, dir string) string {
 		fmt.Sprintf("Frames: %d", summary.Frames),
 		fmt.Sprintf("Unique objects: %d", summary.UniqueObjects),
 		fmt.Sprintf("Peak speed: %.2f px/s", summary.HighestSpeedPxSec),
-		fmt.Sprintf("Original video: %s", filepath.Join(dir, summary.OriginalVideo)),
-		fmt.Sprintf("Tracked video: %s", filepath.Join(dir, summary.TrackedVideo)),
-		fmt.Sprintf("Masked video: %s", filepath.Join(dir, summary.MaskedVideo)),
+		fmt.Sprintf("Original video: %s", formatEventOutputPath(dir, summary.OriginalVideo)),
+		fmt.Sprintf("Tracked video: %s", formatEventOutputPath(dir, summary.TrackedVideo)),
+		fmt.Sprintf("Masked video: %s", formatEventOutputPath(dir, summary.MaskedVideo)),
 		fmt.Sprintf("Track crops: %s", filepath.Join(dir, summary.TrackCropsDir)),
 		fmt.Sprintf("Track names: %s", filepath.Join(dir, summary.TrackNamesFile)),
 	}
@@ -5457,6 +5564,13 @@ func formatEventDetail(detail eventHistoryDetail, dir string) string {
 	lines = append(lines, fmt.Sprintf("  Max simultaneous slow tracks: %d", detail.MaxSlowTracks))
 
 	return stringsJoin(lines, "\n")
+}
+
+func formatEventOutputPath(dir, filename string) string {
+	if filename == "" {
+		return "not exported"
+	}
+	return filepath.Join(dir, filename)
 }
 
 func appendOptionalMetadataLine(lines []string, label string, value *float64, suffix string) []string {

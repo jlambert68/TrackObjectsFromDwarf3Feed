@@ -1,7 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"io"
 	"net"
 	"net/http"
@@ -12,6 +16,84 @@ import (
 	"testing"
 	"time"
 )
+
+func TestLoadObjectListPreviewOwnsPixelsAfterMatClose(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "frame_000001_000000000ms.jpg")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create preview fixture: %v", err)
+	}
+	fixture := image.NewRGBA(image.Rect(0, 0, 8, 8))
+	for y := 0; y < 8; y++ {
+		for x := 0; x < 8; x++ {
+			fixture.Set(x, y, color.RGBA{R: 220, G: 40, B: 20, A: 255})
+		}
+	}
+	if err := jpeg.Encode(file, fixture, nil); err != nil {
+		_ = file.Close()
+		t.Fatalf("encode preview fixture: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close preview fixture: %v", err)
+	}
+
+	preview := loadObjectListPreview(trackedObjectDetail{CropPaths: []string{path}})
+	r, g, b, _ := preview.At(4, 4).RGBA()
+	if r < 0x8000 || g > 0x6000 || b > 0x6000 {
+		t.Fatalf("preview pixels were lost after closing source Mat: r=%d g=%d b=%d", r, g, b)
+	}
+}
+
+func TestLoadEventHistoryPreservesOptionalVideoOutputs(t *testing.T) {
+	root := t.TempDir()
+	eventDir := filepath.Join(root, "2026-09-10_120000.000")
+	if err := os.MkdirAll(eventDir, 0o755); err != nil {
+		t.Fatalf("create event directory: %v", err)
+	}
+	summary := EventSummary{
+		EventID:       filepath.Base(eventDir),
+		TrackedVideo:  "tracked.avi",
+		OriginalVideo: "",
+		MaskedVideo:   "",
+	}
+	data, err := json.Marshal(summary)
+	if err != nil {
+		t.Fatalf("marshal event summary: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(eventDir, "event.json"), data, 0o644); err != nil {
+		t.Fatalf("write event summary: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(eventDir, "tracked.avi"), []byte("video"), 0o644); err != nil {
+		t.Fatalf("write tracked video fixture: %v", err)
+	}
+
+	entries, err := loadEventHistory(root)
+	if err != nil {
+		t.Fatalf("load event history: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected one event, got %d", len(entries))
+	}
+	got := entries[0].Summary
+	if got.OriginalVideo != "" || got.MaskedVideo != "" || got.TrackedVideo != "tracked.avi" {
+		t.Fatalf("optional outputs were invented: %+v", got)
+	}
+	if path := eventReplayBasePath(entries[0]); path != filepath.Join(eventDir, "tracked.avi") {
+		t.Fatalf("tracked-only event has no replay fallback: %q", path)
+	}
+}
+
+func TestEventFrameIndexUsesEventRelativeVideoPosition(t *testing.T) {
+	frames := []FrameMetadata{
+		{SourceFrame: 224},
+		{SourceFrame: 225},
+		{SourceFrame: 226},
+		{SourceFrame: 227},
+	}
+	if got := eventFrameIndexForSourceFrame(frames, 226); got != 2 {
+		t.Fatalf("source frame mapped to event index %d, want 2", got)
+	}
+}
 
 func TestDwarfMediaMatchesRecordingByTimestamp(t *testing.T) {
 	recordingStartedAt := time.Date(2026, time.August, 21, 14, 35, 0, 0, time.Local)

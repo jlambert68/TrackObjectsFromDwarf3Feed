@@ -45,13 +45,10 @@ func processRawSegmentsParallel(rawSegmentDir string, settings TrackingSettings,
 		return MergedSegmentTracking{}, fmt.Errorf("create processed segment directory: %w", err)
 	}
 
-	workerCount := runtime.NumCPU()
-	if workerCount < 1 {
-		workerCount = 1
-	}
-	if workerCount > len(manifest.Segments) {
-		workerCount = len(manifest.Segments)
-	}
+	// OpenCV parallelizes the expensive image operations internally. Keeping a
+	// small outer pool avoids multiplying those worker threads until the CPU and
+	// memory bus are oversubscribed on high-resolution input.
+	workerCount := rawSegmentWorkerCount(runtime.NumCPU(), len(manifest.Segments))
 
 	jobs := make(chan segmentProcessJob, len(manifest.Segments))
 	results := make(chan segmentProcessResult, len(manifest.Segments))
@@ -178,6 +175,15 @@ func processRawSegmentsParallel(rawSegmentDir string, settings TrackingSettings,
 	return merged, nil
 }
 
+func rawSegmentWorkerCount(cpuCount, segmentCount int) int {
+	workerCount := max(1, cpuCount)
+	workerCount = min(workerCount, 3)
+	if segmentCount > 0 {
+		workerCount = min(workerCount, segmentCount)
+	}
+	return workerCount
+}
+
 func trackVideoMetadata(input string, settings TrackingSettings, fallbackFPS float64, capture CaptureMetadata, stopCh <-chan struct{}) (EventMetadata, error) {
 	settings = NormalizeTrackingSettings(settings)
 	settings.RawSegmentDuration = 0
@@ -188,13 +194,15 @@ func trackVideoMetadata(input string, settings TrackingSettings, fallbackFPS flo
 
 	engine := TrackerEngine{
 		Config: TrackerConfig{
-			Input:        input,
-			InputLabel:   "video file",
-			ShowMask:     false,
-			RecordEvents: false,
-			FallbackFPS:  fallbackFPS,
-			Settings:     settings,
-			Capture:      capture,
+			Input:            input,
+			InputLabel:       "video file",
+			ShowMask:         false,
+			RecordEvents:     false,
+			FallbackFPS:      fallbackFPS,
+			AnalysisMaxWidth: defaultAnalysisMaxWidth,
+			PreviewFPS:       0,
+			Settings:         settings,
+			Capture:          capture,
 		},
 		Stop: stopCh,
 		Hooks: TrackerHooks{

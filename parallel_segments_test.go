@@ -38,3 +38,12 @@ func TestProcessRawSegmentsParallelReturnsWhenAlreadyCancelled(t *testing.T) {
 		t.Fatal("cancelled parallel segment processing did not return")
 	}
 }
+
+func TestRawSegmentWorkerCountCapsOpenCVOversubscription(t *testing.T) {
+	if got := rawSegmentWorkerCount(16, 20); got != 3 {
+		t.Fatalf("worker count = %d, want 3", got)
+	}
+	if got := rawSegmentWorkerCount(16, 2); got != 2 {
+		t.Fatalf("worker count = %d, want 2 for two segments", got)
+	}
+}

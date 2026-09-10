@@ -26,7 +26,7 @@ const (
 	minTrackCropHeight = 96
 )
 
-// trimBuffer keeps only the pre-event time window in RAM and releases the Mats
+// trimBuffer keeps only the pre-event time window and removes temporary files
 // for frames that have aged out.
 func trimBuffer(buffer []BufferedFrame, cutoff time.Time) []BufferedFrame {
 	firstKeep := 0
@@ -41,7 +41,7 @@ func trimBuffer(buffer []BufferedFrame, cutoff time.Time) []BufferedFrame {
 	return buffer[firstKeep:]
 }
 
-// closeBuffer releases all Mats still owned by the rolling pre-event buffer.
+// closeBuffer removes temporary files still owned by the pre-event buffer.
 func closeBuffer(buffer []BufferedFrame) {
 	for i := range buffer {
 		removeBufferedFrameFiles(buffer[i])
@@ -57,21 +57,32 @@ func removeBufferedFrameFiles(frame BufferedFrame) {
 	}
 }
 
-func spoolBufferedFrame(frame gocv.Mat, mask gocv.Mat, dir string, meta FrameMetadata, timestamp time.Time) (BufferedFrame, error) {
+func bufferFrame(frame gocv.Mat, mask gocv.Mat, dir string, meta FrameMetadata, timestamp time.Time, includeImage, includeMask bool) (BufferedFrame, error) {
+	if !includeImage && !includeMask {
+		return BufferedFrame{Timestamp: timestamp, Metadata: meta}, nil
+	}
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return BufferedFrame{}, fmt.Errorf("create frame spool directory: %w", err)
 	}
 
 	base := fmt.Sprintf("frame_%06d_%019d", meta.SourceFrame, timestamp.UnixNano())
-	imagePath := filepath.Join(dir, base+".jpg")
-	if ok := gocv.IMWrite(imagePath, frame); !ok {
-		return BufferedFrame{}, fmt.Errorf("spool buffered frame %s", imagePath)
+	imagePath := ""
+	if includeImage {
+		imagePath = filepath.Join(dir, base+".jpg")
+		if ok := gocv.IMWrite(imagePath, frame); !ok {
+			return BufferedFrame{}, fmt.Errorf("spool buffered frame %s", imagePath)
+		}
 	}
 
-	maskPath := filepath.Join(dir, base+".png")
-	if ok := gocv.IMWrite(maskPath, mask); !ok {
-		_ = os.Remove(imagePath)
-		return BufferedFrame{}, fmt.Errorf("spool buffered mask %s", maskPath)
+	maskPath := ""
+	if includeMask {
+		maskPath = filepath.Join(dir, base+".png")
+		if ok := gocv.IMWrite(maskPath, mask); !ok {
+			if imagePath != "" {
+				_ = os.Remove(imagePath)
+			}
+			return BufferedFrame{}, fmt.Errorf("spool buffered mask %s", maskPath)
+		}
 	}
 
 	return BufferedFrame{
@@ -82,7 +93,7 @@ func spoolBufferedFrame(frame gocv.Mat, mask gocv.Mat, dir string, meta FrameMet
 	}, nil
 }
 
-// startEvent creates a new event directory, opens the two output video writers,
+// startEvent creates a new event directory, opens the configured video writers,
 // initializes metadata, and flushes the pre-event buffer into the recording.
 func startEvent(
 	outputRoot string,
@@ -91,6 +102,9 @@ func startEvent(
 	buffer []BufferedFrame,
 	settings TrackingSettings,
 	capture CaptureMetadata,
+	sourceVideo string,
+	writeOriginal bool,
+	writeMask bool,
 ) (*EventRecorder, error) {
 	if len(buffer) == 0 {
 		return nil, errors.New("cannot start event with empty buffer")
@@ -111,47 +125,43 @@ func startEvent(
 		return nil, err
 	}
 
-	rawPath := filepath.Join(dir, "original.avi")
-	trackedPath := filepath.Join(dir, "tracked.avi")
-	maskedPath := filepath.Join(dir, "masked.avi")
-
-	rawWriter, err := gocv.VideoWriterFile(rawPath, "MJPG", fps, width, height, true)
-	if err != nil {
-		return nil, fmt.Errorf("create original video: %w", err)
-	}
-	if !rawWriter.IsOpened() {
-		rawWriter.Close()
-		return nil, errors.New("original video writer did not open")
+	var (
+		rawWriter *gocv.VideoWriter
+		err       error
+	)
+	if writeOriginal {
+		rawWriter, err = openEventVideoWriter(filepath.Join(dir, "original.avi"), fps, width, height, true)
+		if err != nil {
+			return nil, fmt.Errorf("create original video: %w", err)
+		}
 	}
 
-	trackedWriter, err := gocv.VideoWriterFile(trackedPath, "MJPG", fps, width, height, true)
+	trackedWriter, err := openEventVideoWriter(filepath.Join(dir, "tracked.avi"), fps, width, height, true)
 	if err != nil {
-		rawWriter.Close()
+		if rawWriter != nil {
+			rawWriter.Close()
+		}
 		return nil, fmt.Errorf("create tracked video: %w", err)
 	}
-	if !trackedWriter.IsOpened() {
-		rawWriter.Close()
-		trackedWriter.Close()
-		return nil, errors.New("tracked video writer did not open")
-	}
 
-	maskedWriter, err := gocv.VideoWriterFile(maskedPath, "MJPG", fps, width, height, true)
-	if err != nil {
-		rawWriter.Close()
-		trackedWriter.Close()
-		return nil, fmt.Errorf("create masked video: %w", err)
-	}
-	if !maskedWriter.IsOpened() {
-		rawWriter.Close()
-		trackedWriter.Close()
-		maskedWriter.Close()
-		return nil, errors.New("masked video writer did not open")
+	var maskedWriter *gocv.VideoWriter
+	if writeMask {
+		maskedWriter, err = openEventVideoWriter(filepath.Join(dir, "masked.avi"), fps, width, height, false)
+		if err != nil {
+			if rawWriter != nil {
+				rawWriter.Close()
+			}
+			trackedWriter.Close()
+			return nil, fmt.Errorf("create masked video: %w", err)
+		}
 	}
 
 	recorder := &EventRecorder{
 		RawWriter:     rawWriter,
 		TrackedWriter: trackedWriter,
 		MaskedWriter:  maskedWriter,
+		WriteOriginal: writeOriginal,
+		WriteMask:     writeMask,
 		Directory:     dir,
 		StartedAt:     startedAt,
 		FPS:           fps,
@@ -165,40 +175,96 @@ func startEvent(
 	}
 
 	if err := recorder.openTrackingStream(); err != nil {
-		rawWriter.Close()
-		trackedWriter.Close()
-		maskedWriter.Close()
+		_ = recorder.closeWriters()
 		return nil, err
 	}
 
-	for _, bf := range buffer {
-		frame := gocv.IMRead(bf.ImagePath, gocv.IMReadColor)
-		if frame.Empty() {
-			_ = recorder.closeWriters()
-			_ = recorder.closeTrackingStream()
-			return nil, fmt.Errorf("read buffered frame %s", bf.ImagePath)
-		}
+	if err := recorder.flushBufferedFrames(buffer, sourceVideo); err != nil {
+		_ = recorder.closeWriters()
+		_ = recorder.closeTrackingStream()
+		return nil, err
+	}
 
-		mask := gocv.IMRead(bf.MaskPath, gocv.IMReadGrayScale)
-		if mask.Empty() {
+	return recorder, nil
+}
+
+func (r *EventRecorder) flushBufferedFrames(buffer []BufferedFrame, sourceVideo string) error {
+	var sourceCapture *gocv.VideoCapture
+	nextSourceFrame := 0
+	defer func() {
+		if sourceCapture != nil {
+			sourceCapture.Close()
+		}
+	}()
+
+	for _, buffered := range buffer {
+		frame := gocv.NewMat()
+		if buffered.ImagePath != "" {
 			frame.Close()
-			_ = recorder.closeWriters()
-			_ = recorder.closeTrackingStream()
-			return nil, fmt.Errorf("read buffered mask %s", bf.MaskPath)
+			frame = gocv.IMRead(buffered.ImagePath, gocv.IMReadColor)
+			if frame.Empty() {
+				frame.Close()
+				return fmt.Errorf("read buffered frame %s", buffered.ImagePath)
+			}
+		} else {
+			if sourceVideo == "" || buffered.Metadata.SourceFrame < 1 {
+				frame.Close()
+				return errors.New("buffered video frame has no seekable source")
+			}
+			if sourceCapture == nil {
+				var err error
+				sourceCapture, err = gocv.VideoCaptureFile(sourceVideo)
+				if err != nil {
+					frame.Close()
+					return fmt.Errorf("open pre-event source video: %w", err)
+				}
+				if !sourceCapture.IsOpened() {
+					frame.Close()
+					return errors.New("pre-event source video did not open")
+				}
+			}
+			if buffered.Metadata.SourceFrame != nextSourceFrame {
+				sourceCapture.Set(gocv.VideoCapturePosFrames, float64(buffered.Metadata.SourceFrame-1))
+			}
+			if ok := sourceCapture.Read(&frame); !ok || frame.Empty() {
+				frame.Close()
+				return fmt.Errorf("decode buffered source frame %d", buffered.Metadata.SourceFrame)
+			}
+			nextSourceFrame = buffered.Metadata.SourceFrame + 1
 		}
 
-		if err := recorder.RecordFrame(frame, mask, nil, bf.Metadata); err != nil {
+		mask := gocv.NewMat()
+		if r.MaskedWriter != nil {
+			mask.Close()
+			mask = gocv.IMRead(buffered.MaskPath, gocv.IMReadGrayScale)
+			if mask.Empty() {
+				frame.Close()
+				mask.Close()
+				return fmt.Errorf("read buffered mask %s", buffered.MaskPath)
+			}
+		}
+
+		if err := r.RecordFrame(frame, mask, nil, buffered.Metadata); err != nil {
 			frame.Close()
 			mask.Close()
-			_ = recorder.closeWriters()
-			_ = recorder.closeTrackingStream()
-			return nil, err
+			return err
 		}
 		frame.Close()
 		mask.Close()
 	}
+	return nil
+}
 
-	return recorder, nil
+func openEventVideoWriter(path string, fps float64, width, height int, isColor bool) (*gocv.VideoWriter, error) {
+	writer, err := gocv.VideoWriterFile(path, "MJPG", fps, width, height, isColor)
+	if err != nil {
+		return nil, err
+	}
+	if !writer.IsOpened() {
+		writer.Close()
+		return nil, errors.New("video writer did not open")
+	}
+	return writer, nil
 }
 
 // RecordFrame writes one raw frame, creates the annotated tracked frame, and
@@ -206,25 +272,38 @@ func startEvent(
 func (r *EventRecorder) RecordFrame(clean gocv.Mat, mask gocv.Mat, tracks []*Track, meta FrameMetadata) error {
 	meta.TimeMS = time.Unix(0, meta.TimeUnixNS).Sub(r.StartedAt).Milliseconds()
 
-	if err := r.RawWriter.Write(clean); err != nil {
-		return fmt.Errorf("write original video: %w", err)
+	if r.RawWriter != nil {
+		if err := r.RawWriter.Write(clean); err != nil {
+			return fmt.Errorf("write original video: %w", err)
+		}
 	}
 
-	overlay := clean.Clone()
-	drawMetadataOverlay(&overlay, meta.Tracks, r.Settings)
-	if err := r.TrackedWriter.Write(overlay); err != nil {
+	if r.TrackedWriter != nil {
+		overlay := clean.Clone()
+		drawMetadataOverlay(&overlay, meta.Tracks, r.Settings)
+		if err := r.TrackedWriter.Write(overlay); err != nil {
+			overlay.Close()
+			return fmt.Errorf("write tracked video: %w", err)
+		}
 		overlay.Close()
-		return fmt.Errorf("write tracked video: %w", err)
 	}
-	overlay.Close()
 
-	maskBGR := gocv.NewMat()
-	defer maskBGR.Close()
-	if err := gocv.CvtColor(mask, &maskBGR, gocv.ColorGrayToBGR); err != nil {
-		return fmt.Errorf("convert mask video frame: %w", err)
-	}
-	if err := r.MaskedWriter.Write(maskBGR); err != nil {
-		return fmt.Errorf("write masked video: %w", err)
+	if r.MaskedWriter != nil {
+		if mask.Empty() {
+			return errors.New("write masked video: empty mask frame")
+		}
+		maskFrame := mask
+		resizedMask := gocv.NewMat()
+		defer resizedMask.Close()
+		if mask.Cols() != r.Width || mask.Rows() != r.Height {
+			if err := gocv.Resize(mask, &resizedMask, image.Pt(r.Width, r.Height), 0, 0, gocv.InterpolationNearestNeighbor); err != nil {
+				return fmt.Errorf("resize mask video frame: %w", err)
+			}
+			maskFrame = resizedMask
+		}
+		if err := r.MaskedWriter.Write(maskFrame); err != nil {
+			return fmt.Errorf("write masked video: %w", err)
+		}
 	}
 
 	if len(tracks) > 0 {
@@ -275,6 +354,15 @@ func (r *EventRecorder) Finish(endedAt time.Time) error {
 		photometry.MinLuma = 0
 	}
 
+	originalVideo := ""
+	if r.WriteOriginal {
+		originalVideo = "original.avi"
+	}
+	maskedVideo := ""
+	if r.WriteMask {
+		maskedVideo = "masked.avi"
+	}
+
 	summary := EventSummary{
 		EventID:           r.EventID,
 		StartedAt:         r.StartedAt,
@@ -286,9 +374,9 @@ func (r *EventRecorder) Finish(endedAt time.Time) error {
 		Frames:            r.FramesWritten,
 		UniqueObjects:     len(r.SeenIDs),
 		HighestSpeedPxSec: r.HighestSpeed,
-		OriginalVideo:     "original.avi",
+		OriginalVideo:     originalVideo,
 		TrackedVideo:      "tracked.avi",
-		MaskedVideo:       "masked.avi",
+		MaskedVideo:       maskedVideo,
 		TrackCropsDir:     "track_crops",
 		TrackNamesFile:    "track_names.json",
 		TrackingMetadata:  "tracking.json",

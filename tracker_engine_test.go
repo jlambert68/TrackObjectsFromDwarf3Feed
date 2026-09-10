@@ -91,6 +91,9 @@ func TestFinishTrackerRunResourcesFinalizesOpenEventAfterError(t *testing.T) {
 	if !summary.EndedAt.Equal(endedAt) || summary.DurationSeconds != 2 {
 		t.Fatalf("unexpected finalized event timing: %+v", summary)
 	}
+	if summary.OriginalVideo != "" || summary.MaskedVideo != "" || summary.TrackedVideo != "tracked.avi" {
+		t.Fatalf("unexpected optional event outputs: %+v", summary)
+	}
 	trackingData, err := os.ReadFile(filepath.Join(dir, "tracking.json"))
 	if err != nil {
 		t.Fatalf("read finalized tracking metadata: %v", err)

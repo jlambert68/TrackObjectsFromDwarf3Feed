@@ -3,17 +3,22 @@
 Reads the DWARF 3 live RTSP stream, detects fast-moving blobs, tracks multiple objects,
 and automatically records event folders containing:
 
-- `original.avi` — untouched frames from the RTSP stream
 - `tracked.avi` — the same frames with boxes, IDs, trails, velocity arrows and speed
-- `masked.avi` — the cleaned binary motion mask used for detection
+- `original.avi` — optional untouched event frames
+- `masked.avi` — optional cleaned binary motion mask used for detection
 - `track_crops/` — per-object close-up snapshots grouped by tracked object ID
 - `track_names.json` — user-editable names for tracked objects in that event
 - `tracking.json` — per-frame coordinates, bounding boxes and velocity metadata
 - `event.json` — summary for the event
 
-The program does not continuously record video. It keeps about 5 seconds of clean
-frames in RAM. When a valid fast track appears it writes that prebuffer, records
-while objects are present, and continues for 5 seconds after the last tracked object.
+The program does not continuously record event video. For stored video files it
+keeps source-frame references for the five-second pre-event window and seeks back
+to those frames only when an event begins. Live streams use a temporary compressed
+frame buffer. Recording continues for five seconds after the last tracked object.
+
+Sources wider than 1920 pixels are analyzed at 1920 pixels while detections and
+speeds are scaled back to source coordinates. The GUI preview is limited to 960
+pixels wide and sampled at 10 FPS; event exports and crops keep the source size.
 
 It can also optionally save overlapping raw video segments for later offline or
 parallel processing. When enabled, the tracker writes `raw_segments/<session>/`
@@ -58,9 +63,9 @@ go run . -fps 30
 ```text
 events/
   2026-08-11_151000.123/
-    original.avi
     tracked.avi
-    masked.avi
+    original.avi  # optional
+    masked.avi    # optional
     track_crops/
       object_0001/
         frame_000123_000004321ms.jpg
@@ -90,7 +95,9 @@ motion detection.
 
 ## Source comments
 
-`main.go` is extensively commented around the capture pipeline, detection thresholds, tracking association, RAM ownership, event triggering, dual-video recording, and JSON metadata.
+The tracker and recording files are commented around the capture pipeline,
+detection thresholds, tracking association, pre-event buffering, configurable
+event recording, and JSON metadata.
 
 ## Input source
 
@@ -114,7 +121,7 @@ Stored video file:
 go run . -source=file -file /path/to/video.mp4
 ```
 
-The same detection, tracking, prebuffer, dual-video recording, and JSON metadata
+The same detection, tracking, prebuffer, configurable event recording, and JSON metadata
 pipeline is used for both input types.
 
 ## Live DWARF integration tests

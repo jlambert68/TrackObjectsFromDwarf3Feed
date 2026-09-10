@@ -197,3 +197,35 @@ func TestNormalizeTrackingSettingsReplacesNonFiniteValues(t *testing.T) {
 		t.Fatalf("negative pre-event duration was not normalized: %s", got.PreEventDuration)
 	}
 }
+
+func TestMakeTrailMetadataKeepsRecentDisplayHistoryBounded(t *testing.T) {
+	points := make([]image.Point, maxMetadataTrailPoints+10)
+	for i := range points {
+		points[i] = image.Pt(i, i*2)
+	}
+
+	trail := makeTrailMetadata(points)
+	if len(trail) != maxMetadataTrailPoints {
+		t.Fatalf("unexpected trail length: got %d want %d", len(trail), maxMetadataTrailPoints)
+	}
+	if trail[0] != (TrailPoint{X: 10, Y: 20}) || trail[len(trail)-1] != (TrailPoint{X: len(points) - 1, Y: (len(points) - 1) * 2}) {
+		t.Fatalf("trail did not retain the most recent points: first=%+v last=%+v", trail[0], trail[len(trail)-1])
+	}
+}
+
+func TestBallProfileMatchesMotionBlurSizeChanges(t *testing.T) {
+	settings := DefaultTrackingSettingsForProfile(trackingProfileBall)
+	track := &Track{
+		Rect:     image.Rect(200, 900, 260, 920),
+		Position: image.Pt(230, 910),
+		Hits:     8,
+	}
+	detection := Detection{
+		Rect:   image.Rect(210, 820, 390, 940),
+		Center: image.Pt(300, 880),
+	}
+
+	if _, ok := scoreTrackDetectionMatch(track, detection, 230, 910, settings); !ok {
+		t.Fatal("ball profile rejected the same ball after motion blur enlarged its contour")
+	}
+}
