@@ -28,7 +28,12 @@ func TestTELERecordingRetainsSmallSlowObjects(t *testing.T) {
 	settings.MOG2VarThreshold = 16
 
 	trackFrames := make(map[int][]int)
-	helicopterFrames := make(map[int][]int)
+	type helicopterObservation struct {
+		frame int
+		x     int
+		y     int
+	}
+	helicopterTracks := make(map[int][]helicopterObservation)
 	engine := TrackerEngine{
 		Config: TrackerConfig{
 			Input:            teleSmallObjectRegressionVideo,
@@ -41,8 +46,15 @@ func TestTELERecordingRetainsSmallSlowObjects(t *testing.T) {
 		Hooks: TrackerHooks{OnFrame: func(update *FrameUpdate) error {
 			for _, track := range update.Metadata.Tracks {
 				trackFrames[track.ID] = append(trackFrames[track.ID], update.SourceFrame)
-				if track.X >= 2500 && track.X <= 3500 && track.Y >= 900 && track.Y <= 1500 {
-					helicopterFrames[track.ID] = append(helicopterFrames[track.ID], update.SourceFrame)
+				// The known helicopter travels left-to-right from about (1895,1150)
+				// to (3835,1050) during frames 6..293 in the reference event.
+				expectedX := 1850 + update.SourceFrame*7
+				if track.X >= expectedX-180 && track.X <= expectedX+180 && track.Y >= 1000 && track.Y <= 1200 {
+					helicopterTracks[track.ID] = append(helicopterTracks[track.ID], helicopterObservation{
+						frame: update.SourceFrame,
+						x:     track.X,
+						y:     track.Y,
+					})
 				}
 			}
 			return nil
@@ -58,12 +70,26 @@ func TestTELERecordingRetainsSmallSlowObjects(t *testing.T) {
 			longTracks++
 		}
 	}
+	continuousHelicopterTracks := 0
+	for _, observations := range helicopterTracks {
+		if len(observations) >= 200 &&
+			observations[len(observations)-1].frame-observations[0].frame >= 250 &&
+			observations[len(observations)-1].x-observations[0].x >= 1500 {
+			continuousHelicopterTracks++
+		}
+	}
 	t.Logf("TELE small-object tracks: stable_tracks=%d classified_ids=%d", longTracks, len(trackFrames))
-	t.Logf("dark-helicopter region coverage: %v", helicopterFrames)
+	t.Logf("dark-helicopter path coverage: continuous_tracks=%d tracks=%v", continuousHelicopterTracks, helicopterTracks)
 	if longTracks < 4 {
 		t.Fatalf("only %d small slow objects retained stable tracks, want at least 4", longTracks)
 	}
-	if len(trackFrames) > 100 {
-		t.Fatalf("tiny-object detector produced %d classified IDs, want at most 100", len(trackFrames))
+	// Full-resolution TELE analysis intentionally retains many tiny foreground
+	// contours. Keep a generous ceiling to catch an unbounded-noise regression;
+	// the known-good 2026-08-31 event contained 1,623 unique objects.
+	if len(trackFrames) > 1000 {
+		t.Fatalf("tiny-object detector produced %d classified IDs, want at most 1000", len(trackFrames))
+	}
+	if continuousHelicopterTracks < 1 {
+		t.Fatalf("helicopter was not retained as one sustained track; path coverage=%v", helicopterTracks)
 	}
 }

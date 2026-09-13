@@ -174,9 +174,10 @@ func (e *TrackerEngine) Run() (runErr error) {
 		totalFrames = int(math.Round(capture.Get(gocv.VideoCaptureFrameCount)))
 	}
 
-	// Ball tracking uses temporal differences, so General tracking can retain
-	// MOG2 shadow classification and reject those regions at the binary threshold.
-	detectShadows := settings.Profile == trackingProfileGeneral
+	// Dark aircraft against a bright sky must remain foreground. MOG2's shadow
+	// class uses the intermediate value 127, which the configured foreground
+	// threshold rejects and caused the TELE helicopter to disappear.
+	detectShadows := false
 	background := gocv.NewBackgroundSubtractorMOG2WithParams(settings.MOG2History, settings.MOG2VarThreshold, detectShadows)
 	defer background.Close()
 
@@ -242,7 +243,14 @@ func (e *TrackerEngine) Run() (runErr error) {
 			}
 		}
 
-		processingFrame, analysisScale, err := frameForAnalysis(frame, &analysisFrame, e.Config.AnalysisMaxWidth)
+		analysisMaxWidth := e.Config.AnalysisMaxWidth
+		if settings.Profile == trackingProfileGeneral {
+			// General tracking must retain source resolution. Distant aircraft in
+			// 4K TELE recordings can be only a few pixels high and disappear when
+			// resized to 1080p before background subtraction.
+			analysisMaxWidth = 0
+		}
+		processingFrame, analysisScale, err := frameForAnalysis(frame, &analysisFrame, analysisMaxWidth)
 		if err != nil {
 			continue
 		}
@@ -356,7 +364,10 @@ func (e *TrackerEngine) Run() (runErr error) {
 				}
 				fastDetections := findDetections(fastMask, fastSettings)
 				if len(fastDetections) > 0 {
-					detections = fastDetections
+					// Fast temporal contours supplement General MOG2 detections. Replacing
+					// the full set here dropped unrelated slow aircraft whenever any fast
+					// motion occurred elsewhere in the frame.
+					detections = append(detections, fastDetections...)
 					associationSettings.Profile = trackingProfileBall
 					if associationSettings.MaxMatchDistance < fastDefaults.MaxMatchDistance {
 						associationSettings.MaxMatchDistance = fastDefaults.MaxMatchDistance
